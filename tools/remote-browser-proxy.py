@@ -46,19 +46,26 @@ IDENTITY_FIELD = re.compile(r'^(?:email|username|login|account_?name|base_?url|p
 
 def alias(value):
     with lock:
-        return aliases.setdefault(value, 'ref-' + str(len(aliases) + 1).zfill(4))
+        if value in aliases.values():
+            return value
+        # Keep UUID syntax for the host's route validator, never real identities.
+        return aliases.setdefault(value, '00000000-0000-4000-8000-' + format(len(aliases) + 1, '012x'))
 
 
 def sanitise(value, field=''):
     if isinstance(value, dict):
         account_record = ('provider' in value and 'id' in value) or any(k in value for k in ('accountId', 'account_id'))
-        return {k: sanitise(v, 'account_name' if account_record and k == 'name' else k) for k, v in value.items()}
+        public_page = 'entry' in value and 'title' in value and 'id' in value
+        return {k: v if public_page and k == 'id' else sanitise(v, 'account_name' if account_record and k == 'name' else k) for k, v in value.items()}
     if isinstance(value, list):
         return [sanitise(v, field) for v in value]
     if not isinstance(value, str):
         return value
     # This is a fixed public package identifier, not a host/domain/client ID.
     if value == ops.PLUGIN:
+        return value
+    # Declared web resource names are public build artifacts, not domains.
+    if field in ('path', 'entry') and re.fullmatch(r'web/[A-Za-z0-9_./-]+', value) and '..' not in value.split('/'):
         return value
     if field.lower() in ('id', 'credential_id', 'auth_id', 'account_id', 'accountid', 'client_key_id') and value:
         return alias(value)
@@ -75,7 +82,7 @@ def sanitise(value, field=''):
     if field.lower() not in ('sha256', 'artifactsha256'):
         value = re.sub(r'[A-Za-z0-9_+/=-]{32,}', lambda match: alias(match.group()), value)
     # Credential IDs which are opaque non-UUID IDs also require stable references.
-    if field.lower() in ('credential_id', 'auth_id', 'account_id', 'client_key_id') and value and not value.startswith('ref-'):
+    if field.lower() in ('credential_id', 'auth_id', 'account_id', 'client_key_id') and value:
         value = alias(value)
     return value
 
@@ -83,7 +90,7 @@ def sanitise(value, field=''):
 def restore(value):
     with lock:
         inverse = {v: k for k, v in aliases.items()}
-    return re.sub(r'ref-\d{4,}', lambda match: inverse.get(match.group(), match.group()), value)
+    return UUID.sub(lambda match: inverse.get(match.group(), match.group()), value)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -99,11 +106,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = restore(body.decode()).encode()
         if path in ('/api/auth/status', '/api/auth/refresh'):
             try:
-                ops.current()  # real authorization, not a simulated server response
+                ops.current()  # Validate the deployment Key against the real server.
             except Exception:
                 self.send_error(502, 'admin_key_validation_failed')
                 return
-            data = json.dumps({'code': 0, 'data': {'authenticated': True,
+            # Only this browser auth-guard response is simulated; not cookie login.
+            # CPR's frontend rejects API envelopes whose numeric code is not 200.
+            data = json.dumps({'code': 200, 'message': 'success', 'data': {'authenticated': True,
                 'session': {'role': 'admin', 'expiresAt': '2099-01-01T00:00:00Z'}}}).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')

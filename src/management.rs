@@ -54,6 +54,7 @@ pub fn registration() -> ManagementRegistration {
             // 插件自有路由。
             json_body("POST", "api/credentials/sync"),
             json("GET", "api/state"),
+            json_body("POST", "api/storage/recover"),
             json_body("POST", "api/run"),
             json("DELETE", "api/results"),
             json_body("POST", "api/fingerprint/run"),
@@ -173,6 +174,18 @@ pub async fn handle(
             )
         }
         ("GET", "api/state") => state_reply(state, host).await,
+        ("POST", "api/storage/recover") => {
+            if call.payload.len() > crate::storage::MAXIMUM_SNAPSHOT_BYTES {
+                return json_reply(413, &json!({"error":"恢复快照超过容量，原历史未被覆盖"}));
+            }
+            match serde_json::from_slice::<crate::model::PersistedState>(&call.payload) {
+                Ok(snapshot) => match state.recover(host, snapshot).await {
+                    Ok(report) => json_reply(200, &report),
+                    Err(error) => json_reply(409, &json!({"error":error.message})),
+                },
+                Err(_) => json_reply(400, &json!({"error":"恢复快照格式无效，原历史未被覆盖"})),
+            }
+        }
 
         // ---------------------------------------------- 糖果测试
         ("POST", "api/run") => run_candy(state, host, &call.payload).await,

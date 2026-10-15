@@ -176,9 +176,42 @@ function showDialog(dialog) {
   const backdrop = document.createElement("div");
   backdrop.className = "dialog-backdrop";
   backdrop.addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => backdrop.remove(), { once: true });
+  let observer, refresh;
+  const onEscape = (event) => { if (event.key === "Escape") { event.preventDefault(); dialog.close(); } };
+  const cleanup = () => {
+    clearInterval(refresh);
+    observer?.disconnect();
+    window.removeEventListener("keydown", onEscape);
+    backdrop.remove();
+    for (const name of ["top", "left", "max-height", "max-width"]) dialog.style.removeProperty("--dialog-" + name);
+  };
+  dialog.addEventListener("close", cleanup, { once: true });
   document.body.append(backdrop);
-  dialog.show();
+  try {
+    // Non-modal display is retained for compatibility; allow-modals does not restrict <dialog>.
+    dialog.show();
+    window.addEventListener("keydown", onEscape);
+    if (typeof window.IntersectionObserver === "function") {
+      // Even an opaque sandbox can measure its intersection with the top-level viewport.
+      observer = new IntersectionObserver(([entry]) => {
+        const rect = entry.intersectionRect;
+        if (!dialog.open || rect.width <= 0 || rect.height <= 0) return;
+        dialog.style.setProperty("--dialog-top", (rect.top + rect.height / 2) + "px");
+        dialog.style.setProperty("--dialog-left", (rect.left + rect.width / 2) + "px");
+        dialog.style.setProperty("--dialog-max-height", Math.max(1, rect.height - 32) + "px");
+        dialog.style.setProperty("--dialog-max-width", Math.max(1, rect.width - 32) + "px");
+      });
+      observer.observe(backdrop);
+      // Scrolling within a tall iframe can change the intersection position but not its ratio.
+      // Re-observing requests fresh geometry even when no threshold was crossed.
+      refresh = setInterval(() => { observer.unobserve(backdrop); observer.observe(backdrop); }, 100);
+    }
+  } catch (error) {
+    cleanup();
+    dialog.removeEventListener("close", cleanup);
+    if (dialog.open) dialog.close();
+    throw error;
+  }
 }
 
 async function openResultDetail(type, scope, credentialID, recordID, showDetail) {

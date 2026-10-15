@@ -1,24 +1,25 @@
 //! 插件运行态与持久化：凭证历史、进行中的测试进度与宿主状态存储读写。
 //!
-//! 宿主状态命名空间的单记录上限为 256 KiB，因此写入前会按序列化体积裁剪最旧记录，
-//! 保证状态既能持久化又不会因超限而整体丢失。
+//! 单个历史快照最多 240 KiB，经官方 KV 的双缓冲小分块保存，避免超过 IPC 64 KiB 元数据上限。
+//! 底层索引最后 CAS 提交；保存串行化，读取或校验失败时不覆盖原记录。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use gateway_plugin_sdk::call::host::{StatePutRequest, StatePutResult};
+use gateway_plugin_sdk::call::host::StatePutResult;
 use gateway_plugin_sdk::client::HostClient;
-use tokio::sync::RwLock;
+use gateway_plugin_sdk::{ErrorCode, PluginFault};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::fingerprint::FingerprintResult;
-use crate::host_calls;
 use crate::model::*;
 use crate::modeltrace::TraceResult;
+use crate::storage::{self, HostStore};
 
 pub const STATE_NAMESPACE: &str = "candy-eval";
 pub const STATE_KEY: &str = "global";
-/// 宿主允许 256 KiB；留出余量给序列化开销与并发写入。
-const MAXIMUM_STATE_BYTES: usize = 240 * 1024;
+/// 沿用原快照保留预算；底层分块，不把此预算误当 IPC 单帧上限。
+const MAXIMUM_STATE_BYTES: usize = storage::MAXIMUM_SNAPSHOT_BYTES;
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -39,13 +40,14 @@ struct Inner {
     load_error: Option<String>,
     storage_error: String,
     loaded: bool,
-    /// 宿主状态记录的当前版本；`None` 表示键尚不存在，只能创建。
+    /// 小提交索引的 CAS 版本；None 表示尚无索引（可能仍有旧 global 状态）。
     version: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct StateManager {
     inner: Arc<RwLock<Inner>>,
+    storage_lock: Arc<Mutex<()>>,
 }
 
 impl Default for StateManager {
@@ -58,32 +60,35 @@ impl StateManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner::default())),
+            storage_lock: Arc::new(Mutex::new(())),
         }
     }
 
     /// 首次访问时从宿主读取持久化状态；损坏时只记录错误，不阻塞页面。
     pub async fn ensure_loaded(&self, host: &HostClient) {
-        {
-            let inner = self.inner.read().await;
-            if inner.loaded {
-                return;
-            }
-        }
-        let loaded = host_calls::get_state(host, STATE_NAMESPACE, STATE_KEY)
-            .await
-            .ok()
-            .and_then(|result| result.record);
-        let version = loaded.as_ref().map(|record| record.version);
-        let parsed = loaded.map(|record| serde_json::from_value::<PersistedState>(record.value));
-
-        let mut inner = self.inner.write().await;
-        if inner.loaded {
+        let _save = self.storage_lock.lock().await;
+        if self.inner.read().await.loaded {
             return;
         }
-        inner.loaded = true;
-        inner.version = version;
+        let loaded = match storage::load(&HostStore(host)).await {
+            Ok(value) => value,
+            Err(_) => {
+                let mut inner = self.inner.write().await;
+                inner.load_error =
+                    Some("读取测试记录失败，为保护原记录已暂停保存，请重试。".to_owned());
+                inner.storage_error = inner.load_error.clone().unwrap_or_default();
+                return;
+            }
+        };
+        let version = loaded.as_ref().and_then(|record| record.version);
+        let parsed = loaded.map(|record| serde_json::from_value::<PersistedState>(record.value));
+        let mut inner = self.inner.write().await;
         match parsed {
-            None => {}
+            Some(Err(_)) => {
+                inner.load_error = Some("测试记录格式无效，为保护原记录已暂停保存。".to_owned());
+                inner.storage_error = inner.load_error.clone().unwrap_or_default();
+                return;
+            }
             Some(Ok(state)) => {
                 inner.results = state.results;
                 inner.pelicans = state.pelicans;
@@ -102,11 +107,63 @@ impl StateManager {
                     trim(history);
                 }
             }
-            Some(Err(_)) => {
-                inner.load_error = Some("测试记录格式无效，为保护原记录已暂停保存。".to_owned());
-                inner.storage_error = inner.load_error.clone().unwrap_or_default();
-            }
+            None => {}
         }
+        inner.loaded = true;
+        inner.version = version;
+        inner.load_error = None;
+        inner.storage_error.clear();
+    }
+
+    /// 仅经宿主管理桥恢复远端私有备份；合并重复项，不覆盖用户新测试，也不裁剪历史。
+    pub async fn recover(
+        &self,
+        host: &HostClient,
+        incoming: PersistedState,
+    ) -> Result<serde_json::Value, PluginFault> {
+        let _save = self.storage_lock.lock().await;
+        let mut inner = self.inner.write().await;
+        if inner.load_error.is_some() || !inner.loaded {
+            return Err(PluginFault::new(
+                ErrorCode::Conflict,
+                "已有持久化记录尚未读取，已拒绝覆盖",
+            ));
+        }
+        if !inner.running.is_empty()
+            || !inner.pelican_running.is_empty()
+            || !inner.fingerprint_running.is_empty()
+            || !inner.trace_running.is_empty()
+        {
+            return Err(PluginFault::new(
+                ErrorCode::Conflict,
+                "仍有测试运行，暂不恢复记录",
+            ));
+        }
+        let mut merged = PersistedState {
+            results: inner.results.clone(),
+            pelicans: inner.pelicans.clone(),
+            fingerprints: inner.fingerprints.clone(),
+            traces: inner.traces.clone(),
+        };
+        merge_histories(&mut merged.results, incoming.results)?;
+        merge_histories(&mut merged.pelicans, incoming.pelicans)?;
+        merge_histories(&mut merged.fingerprints, incoming.fingerprints)?;
+        merge_histories(&mut merged.traces, incoming.traces)?;
+        let value = serde_json::to_value(&merged).map_err(|_| recovery_error())?;
+        let bytes = encoded_len(&value);
+        let version = storage::save(&HostStore(host), &value, inner.version).await?;
+        let report = serde_json::json!({"saved":true,"bytes":bytes,"counts":{
+            "results":merged.results.values().map(Vec::len).sum::<usize>(),
+            "pelicans":merged.pelicans.values().map(Vec::len).sum::<usize>(),
+            "fingerprints":merged.fingerprints.values().map(Vec::len).sum::<usize>(),
+            "traces":merged.traces.values().map(Vec::len).sum::<usize>()}});
+        inner.results = merged.results;
+        inner.pelicans = merged.pelicans;
+        inner.fingerprints = merged.fingerprints;
+        inner.traces = merged.traces;
+        inner.version = Some(version);
+        inner.storage_error.clear();
+        Ok(report)
     }
 
     /// 覆盖凭证列表；CPR 账号是唯一来源，不依赖前端同步。
@@ -365,6 +422,7 @@ impl StateManager {
 
     /// 快照并写入宿主；超限时裁剪最旧记录后重试，版本冲突时重读版本重试一次。
     async fn persist(&self, host: &HostClient) {
+        let _save = self.storage_lock.lock().await;
         let (value, expected_version) = {
             let mut inner = self.inner.write().await;
             if let Some(error) = inner.load_error.clone() {
@@ -389,19 +447,8 @@ impl StateManager {
             (value, inner.version)
         };
 
-        let mut outcome = put(host, value.clone(), expected_version).await;
-        // 版本漂移（例如另一次调用刚写入）时重读版本再写一次。
-        if outcome.is_err() {
-            let current = host_calls::get_state(host, STATE_NAMESPACE, STATE_KEY)
-                .await
-                .ok()
-                .and_then(|result| result.record)
-                .map(|record| record.version);
-            if let Some(version) = current {
-                self.inner.write().await.version = Some(version);
-                outcome = put(host, value, Some(version)).await;
-            }
-        }
+        // 同一实例的写入串行化；CAS 冲突必须报告，不能盲目重读版本后覆盖其他更新。
+        let outcome = put(host, value, expected_version).await;
 
         let mut inner = self.inner.write().await;
         inner.storage_error = match outcome {
@@ -419,16 +466,129 @@ async fn put(
     value: serde_json::Value,
     expected_version: Option<u64>,
 ) -> Result<StatePutResult, gateway_plugin_sdk::PluginFault> {
-    host_calls::put_state(
-        host,
-        &StatePutRequest {
-            namespace: STATE_NAMESPACE.to_owned(),
-            key: STATE_KEY.to_owned(),
-            value,
-            expected_version,
-        },
+    Ok(StatePutResult {
+        version: storage::save(&HostStore(host), &value, expected_version).await?,
+    })
+}
+
+fn recovery_error() -> PluginFault {
+    PluginFault::new(
+        ErrorCode::InvalidInput,
+        "恢复记录无效或超过保留上限，原历史未被覆盖",
     )
-    .await
+}
+
+fn merge_histories<T: serde::Serialize + Clone>(
+    target: &mut BTreeMap<String, Vec<T>>,
+    incoming: BTreeMap<String, Vec<T>>,
+) -> Result<(), PluginFault> {
+    for (account, records) in incoming {
+        let history = target.entry(account).or_default();
+        let mut joined = Vec::<T>::new();
+        let mut identifiers = BTreeMap::<String, usize>::new();
+        // 带稳定 ID 的记录不可因浮点重新编码而复制；先核对内容再合并。
+        for record in history.iter().cloned() {
+            let value = serde_json::to_value(&record).map_err(|_| recovery_error())?;
+            if let Some(id) = record_identity(&value) {
+                if let Some(&position) = identifiers.get(id) {
+                    let previous =
+                        serde_json::to_value(&joined[position]).map_err(|_| recovery_error())?;
+                    if !equivalent_record(&previous, &value) {
+                        return Err(recovery_conflict());
+                    }
+                    continue;
+                }
+                identifiers.insert(id.to_owned(), joined.len());
+            }
+            joined.push(record);
+        }
+        let mut present = BTreeMap::<Vec<u8>, usize>::new();
+        for record in &joined {
+            let mut value = serde_json::to_value(record).map_err(|_| recovery_error())?;
+            if record_identity(&value).is_none() {
+                value.sort_all_objects();
+                *present
+                    .entry(serde_json::to_vec(&value).map_err(|_| recovery_error())?)
+                    .or_default() += 1;
+            }
+        }
+        let mut seen = BTreeMap::<Vec<u8>, usize>::new();
+        for record in records {
+            let mut value = serde_json::to_value(&record).map_err(|_| recovery_error())?;
+            if let Some(id) = record_identity(&value) {
+                if let Some(&position) = identifiers.get(id) {
+                    let previous =
+                        serde_json::to_value(&joined[position]).map_err(|_| recovery_error())?;
+                    if !equivalent_record(&previous, &value) {
+                        return Err(recovery_conflict());
+                    }
+                    joined[position] = record; // 使用已保全快照的精确数值。
+                    continue;
+                }
+                identifiers.insert(id.to_owned(), joined.len());
+            } else {
+                // Candy 没有稳定 ID，完整记录的重复次数必须保留。
+                value.sort_all_objects();
+                let encoded = serde_json::to_vec(&value).map_err(|_| recovery_error())?;
+                let occurrence = seen.entry(encoded.clone()).or_default();
+                *occurrence += 1;
+                if *occurrence <= *present.get(&encoded).unwrap_or(&0) {
+                    continue;
+                }
+            }
+            joined.push(record);
+        }
+        if joined.len() > HISTORY_LIMIT {
+            return Err(recovery_error());
+        }
+        let mut ordered = joined
+            .into_iter()
+            .map(|record| {
+                let value = serde_json::to_value(&record).map_err(|_| recovery_error())?;
+                let time = value["time"]
+                    .as_str()
+                    .ok_or_else(recovery_error)?
+                    .to_owned();
+                Ok((time, record))
+            })
+            .collect::<Result<Vec<_>, PluginFault>>()?;
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
+        *history = ordered.into_iter().map(|(_, record)| record).collect();
+    }
+    Ok(())
+}
+
+fn record_identity(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+}
+
+fn recovery_conflict() -> PluginFault {
+    PluginFault::new(ErrorCode::Conflict, "同一记录标识的内容不一致，未覆盖历史")
+}
+
+fn equivalent_record(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) if a.is_f64() && b.is_f64() => {
+            let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+            (a - b).abs() <= 32.0 * f64::EPSILON * a.abs().max(b.abs()).max(f64::MIN_POSITIVE)
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| equivalent_record(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, a)| b.get(key).is_some_and(|b| equivalent_record(a, b)))
+        }
+        _ => false,
+    }
 }
 
 fn trim<T>(history: &mut Vec<T>) {
@@ -551,5 +711,60 @@ mod tests {
         }
         assert!(encoded_len(&value) <= MAXIMUM_STATE_BYTES);
         assert!(state.results["a"].len() < HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn recovery_uses_stable_ids_and_preserves_the_backed_up_float() {
+        let original = serde_json::json!({"id":"fixture-result","time":"2026-01-01T00:00:00Z","answer":"original body","attribution":{"p":1e-9}});
+        let mut rounded = original.clone();
+        rounded["attribution"]["p"] = serde_json::json!(f64::from_bits(1e-9_f64.to_bits() + 1));
+        let mut target = BTreeMap::from([("a".to_owned(), vec![original.clone(), rounded])]);
+        merge_histories(
+            &mut target,
+            BTreeMap::from([("a".to_owned(), vec![original.clone()])]),
+        )
+        .unwrap();
+        assert_eq!(target["a"], vec![original]);
+    }
+
+    #[test]
+    fn recovery_rejects_same_id_with_different_primary_content() {
+        let original = serde_json::json!({"id":"fixture-result","time":"2026-01-01T00:00:00Z","html":"original"});
+        let mut changed = original.clone();
+        changed["html"] = serde_json::json!("different");
+        let mut target = BTreeMap::from([("a".to_owned(), vec![original])]);
+        assert!(merge_histories(
+            &mut target,
+            BTreeMap::from([("a".to_owned(), vec![changed])])
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recovery_preserves_the_multiplicity_of_idless_results() {
+        let record = candy("21");
+        let mut target = BTreeMap::from([("a".to_owned(), vec![record.clone(), record.clone()])]);
+        merge_histories(
+            &mut target,
+            BTreeMap::from([("a".to_owned(), vec![record.clone(), record])]),
+        )
+        .unwrap();
+        assert_eq!(target["a"].len(), 2);
+    }
+
+    #[test]
+    fn json_probabilities_round_trip_without_floating_point_drift() {
+        for seed in [1.0 / 3.0_f64, 1e-9, 1e-30, 1e200] {
+            for step in 0..128 {
+                let n = f64::from_bits(seed.to_bits() + step);
+                let value = serde_json::json!({"probability":n});
+                let decoded: serde_json::Value =
+                    serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+                assert_eq!(
+                    decoded["probability"].as_f64().unwrap().to_bits(),
+                    n.to_bits()
+                );
+            }
+        }
     }
 }

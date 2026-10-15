@@ -77,6 +77,7 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
     let mut key_pages = 0;
     let mut stream_closed = false;
     let mut record = None;
+    let mut states = std::collections::BTreeMap::<String, Value>::new();
     let mut returned = false;
     for _ in 0..100 {
         if record.is_some() && returned {
@@ -112,7 +113,9 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
             );
         }
         let result = match method.as_str() {
-            "host.state.get" => json!({"record":null}),
+            "host.state.get" => {
+                json!({"record": states.get(params["key"].as_str().unwrap()).map(|value| json!({"value":value,"version":1,"schema_version":1}))})
+            }
             ACCOUNTS_LIST => {
                 assert_eq!(params, json!({}));
                 let _query: AccountFactsQuery = serde_json::from_slice(&frame.payload).unwrap();
@@ -214,10 +217,26 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
                 json!({})
             }
             "host.state.put" => {
-                let records = params["value"]["results"]["test-account"]
-                    .as_array()
-                    .unwrap();
-                record = records.last().cloned();
+                assert!(frame.payload.is_empty());
+                let key = params["key"].as_str().unwrap();
+                states.insert(key.to_owned(), params["value"].clone());
+                if key == "snapshot-v2" {
+                    let bank = params["value"]["bank"].as_u64().unwrap();
+                    let chunks = params["value"]["chunks"].as_u64().unwrap();
+                    let encoded = (0..chunks)
+                        .map(|n| {
+                            states[&format!("snapshot-{bank}-{n:02}")]["data"]
+                                .as_str()
+                                .unwrap()
+                        })
+                        .collect::<String>();
+                    let snapshot: Value = serde_json::from_str(&encoded).unwrap();
+                    record = snapshot["results"]["test-account"]
+                        .as_array()
+                        .unwrap()
+                        .last()
+                        .cloned();
+                }
                 serde_json::to_value(StatePutResult { version: 1 }).unwrap()
             }
             "host.model.list" => json!({"models":["gpt-6.1-sol"]}),

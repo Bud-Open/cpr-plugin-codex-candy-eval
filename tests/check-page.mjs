@@ -140,6 +140,9 @@ const GLOBALS_BLOCKED = ["fetch", "XMLHttpRequest", "WebSocket", "localStorage",
 
 const calls = [];
 let mockAnswers = [true, false, true];
+// /run 的真实 CPR 契约：started 为整数，另外三项为账号 ID 数组。
+let mockRunResponse = { started: 1, skipped: [], unchecked: [], busy: [] };
+let mockRunGate = null, mockRunStatus = 200;
 
 function mockBackend(call) {
   // 真实插件状态里失败记录的字段集：没有 attribution，samples 为空数组。
@@ -159,7 +162,9 @@ function mockBackend(call) {
     "GET api/accounts": () => ({ accounts: [credential], revision: "rev1" }),
     "GET api/models": () => ({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6.1-sol(xhigh)" }] }),
     "GET api/accounts/models": () => ({ models: [{ id: "gpt-6.1-sol" }] }),
-    "POST api/run": () => ({ started: 1, skipped: 0, unchecked: 0, busy: 0 }),
+    "POST api/run": () => mockRunResponse,
+    "POST api/modeltrace/run": () => mockRunResponse,
+    "POST api/pelican/run": () => mockRunResponse,
     "GET api/modeltrace/record": () => mtRecord,
   };
   if (`${call.method} ${call.path}` === "GET api/state") {
@@ -172,7 +177,9 @@ function mockBackend(call) {
   }
   const handler = routes[`${call.method} ${call.path}`];
   if (!handler) return { status: 404, body: { error: { message: `未注册路由：${call.method} ${call.path}` } } };
-  return { status: 200, body: handler() };
+  const isRun = call.method === "POST" && call.path.endsWith("/run");
+  const respond = () => ({ status: isRun ? mockRunStatus : 200, body: handler() });
+  return isRun && mockRunGate ? mockRunGate.then(respond) : respond();
 }
 
 // 复刻 frame.ts 的装配结果：脚本与样式内联成页面自带内容，桥脚本前置注入 <head>。
@@ -202,12 +209,11 @@ const bridgeSource = `
     request(input) {
       const call = { method: String(input.method || "").toUpperCase(), path: String(input.path || ""), query: input.query == null ? "" : String(input.query) };
       window.__calls.push(call);
-      const answer = window.__backend(call);
-      return Promise.resolve({
+      return Promise.resolve(window.__backend(call)).then((answer) => ({
         status: answer.status,
         contentType: "application/json",
         body: new TextEncoder().encode(JSON.stringify(answer.body)).buffer,
-      });
+      }));
     },
   };
   Object.defineProperty(window, "codexProxyPlugin", { value: Object.freeze(api), configurable: false, writable: false });
@@ -227,13 +233,22 @@ const dom = new JSDOM(srcdoc, {
   beforeParse(window) {
     window.__calls = calls;
     window.__backend = mockBackend;
-    // jsdom 未实现 <dialog>；按宿主资源 CSP 的沙箱语义补齐：只有非模态 show() 可用。
+    // jsdom lacks <dialog>; exercise the non-modal compatibility path, not sandbox permissions.
     const dialogProto = window.HTMLDialogElement.prototype;
     dialogProto.show = function () { this.setAttribute("open", ""); };
-    dialogProto.showModal = function () {
-      throw new window.DOMException("The document is sandboxed and lacks the 'allow-modals' keyword.", "SecurityError");
-    };
+    dialogProto.showModal = function () { throw new Error("Native modal intentionally unavailable in this fixture"); };
     dialogProto.close = function () { this.removeAttribute("open"); this.dispatchEvent(new window.Event("close")); };
+    window.__viewportObservations = 0;
+    window.__viewportDisconnects = 0;
+    window.IntersectionObserver = class {
+      constructor(callback) { this.callback = callback; }
+      observe() {
+        window.__viewportObservations++;
+        this.callback([{ intersectionRect: { top: 80, left: 20, height: 480, width: 640 } }]);
+      }
+      unobserve() {}
+      disconnect() { window.__viewportDisconnects++; }
+    };
     // jsdom 未实现 CSS.escape；浏览器里始终存在，这里给一个等价的属性值转义实现。
     window.CSS = { escape: (value) => String(value).replace(/[^a-zA-Z0-9_-]/g, (ch) => "\\" + ch) };
     // jsdom 未实现 matchMedia；浏览器里始终存在，这里补一个最小替身。
@@ -264,6 +279,7 @@ for (const error of errors) fail(`页面抛出异常：${error}`);
 check($("app") && !$("app").hidden, "主界面未显示");
 check($("login") && $("login").hidden, "不应要求管理密钥登录");
 check(doc.documentElement.dataset.cprPluginHost === "", "未标记 CPR 宿主，主题样式不会生效");
+check(['0', '0px'].includes(dom.window.getComputedStyle(doc.querySelector('main')).minHeight), "CPR 自动高度页面不得保留视口最小高度");
 
 const options = [...$("model").options].map((option) => option.value);
 check(options.includes("gpt-6.1-sol"), `模型下拉缺少目标模型：${JSON.stringify(options)}`);
@@ -288,7 +304,7 @@ for (const suite of ["modeltrace", "pelican", "candy"]) {
   check($("tab-" + suite)?.getAttribute("aria-selected") === "true", `${suite} 页签未选中`);
 }
 
-// 沙箱（sandbox allow-scripts）禁用 modal：详情必须用非模态对话框打开，且失败原因可见。
+// 非模态兼容路径、可见区域定位与失败原因展示；真实布局另用 Chrome OOPIF 回归。
 $("tab-modeltrace")?.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
 await wait(50);
 $("mt-rows")?.querySelector("[data-row]")?.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
@@ -300,10 +316,17 @@ await wait(400);
 check($("mt-detail")?.open === true, "查看详情未能打开详情对话框");
 check(!!doc.querySelector(".dialog-backdrop"), "非模态对话框缺少遮罩");
 check(($("mt-detail-body")?.textContent || "").includes("no upstream provider"), "详情未显示失败原因");
+check($('mt-detail').style.getPropertyValue('--dialog-top') === '320px', "弹窗未按可见区域居中");
+check($('mt-detail').style.getPropertyValue('--dialog-max-height') === '448px', "弹窗未限制在可见区域内");
 $("mt-detail-close")?.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
 await wait(20);
 check($("mt-detail")?.open === false, "关闭详情后对话框仍处于打开状态");
 check(!doc.querySelector(".dialog-backdrop"), "关闭后遮罩残留");
+check(dom.window.__viewportDisconnects === 1, "关闭详情未释放可见区域观察器");
+const observationsAfterClose = dom.window.__viewportObservations;
+await wait(180);
+check(dom.window.__viewportObservations === observationsAfterClose, "关闭后仍在轮询弹窗几何");
+check(!$('mt-detail').style.getPropertyValue('--dialog-top'), "关闭后遗留弹窗定位");
 const callsSeen = new Set(calls.map((call) => `${call.method} ${call.path}`));
 for (const expected of [
   "GET api/accounts",
@@ -317,11 +340,65 @@ for (const expected of [
 const registered = new Set(JSON.parse(readFileSync(path.join(root, "tests", "routes.json"), "utf8")).map(([method, route]) => `${method} ${route}`));
 for (const key of callsSeen) check(registered.has(key), `后端未注册页面调用的路由：${key}`);
 
+// 通知必须使用真实数组契约，不能把空数组当作跳过、告警或可展示的 ID 文本。
+const noticeFor = (response) => dom.window.eval(`runResponseNotice(${JSON.stringify(response)})`);
+const empty = noticeFor({ started: 1, skipped: [], unchecked: [], busy: [] });
+check(empty.tone === "info", "全量执行完成不能被空数组染成黄色告警");
+check(empty.message.includes("已结束") && !empty.message.includes("开始测试"), "同步完成响应不能被标为开始测试");
+check(!/跳过|无法读取|仍会尝试/.test(empty.message), "空数组不能产生跳过或未知模型警告");
+for (const field of ["skipped", "unchecked", "busy"]) {
+  const notice = noticeFor({ started: 1, skipped: [], unchecked: [], busy: [], [field]: ["private-one", "private-two"] });
+  check(notice.tone === "warning" && notice.message.includes("2 个凭证"), `${field} 应显示数组长度及真实警告`);
+  check(!notice.message.includes("private-"), `${field} 不得把账号 ID 拼到通知中`);
+  if (field === "unchecked") check(notice.message.includes("已跳过") && !notice.message.includes("仍会尝试"), "未确认模型的实际跳过行为不能写成仍会尝试");
+}
+const zero = noticeFor({ started: 0, skipped: [], unchecked: [], busy: [] });
+check(zero.tone === "warning" && zero.message.includes("未执行"), "无执行项不能宣称测试已结束或已启动");
+const numeric = noticeFor({ started: 2, skipped: 0, unchecked: 0, busy: 1 });
+check(numeric.tone === "warning" && numeric.message.includes("1 个凭证已有任务"), "数字计数兼容路径失效");
+const invalid = noticeFor({ started: 1, skipped: -1, unchecked: "private-id", busy: {} });
+check(invalid.tone === "info" && !invalid.message.includes("private-id"), "异常计数字段不应回显标识或产生虚假告警");
+
+const until = async (predicate, label) => {
+  const deadline = Date.now() + 4000;
+  while (!predicate() && Date.now() < deadline) await wait(10);
+  check(predicate(), label);
+};
+const flash = () => $("flash").querySelector(".notice-message").textContent;
 const runButton = $("run-batch");
 check(runButton && !runButton.disabled, "测试按钮应可用");
-runButton?.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
-await wait(800);
-check(calls.some((call) => call.path === "api/run"), "点击测试未触发 api/run");
+for (const route of ["/run", "/modeltrace/run", "/pelican/run"]) {
+  let finish;
+  mockRunGate = new Promise((resolve) => { finish = resolve; });
+  const before = calls.filter((call) => call.path === "api" + route).length;
+  let action;
+  if (route === "/run") runButton.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+  else action = dom.window.eval(`update(${JSON.stringify(route)}, { method: "POST", body: { auth_ids: ["acct-1"], model: "gpt-6.1-sol" } }, "开始测试失败")`);
+  check(!$("flash").hidden && flash().includes("正在准备"), `${route} 点击后应立即显示准备提示`);
+  await until(() => calls.filter((call) => call.path === "api" + route).length > before, `${route} 未提交运行请求`);
+  check($("flash").dataset.tone === "info" && flash().includes("等待执行结果"), `${route} 响应前应显示普通执行提示`);
+  check(!flash().includes("已结束"), `${route} 响应前不能提前宣称测试结束`);
+  check(runButton.disabled, `${route} 运行期间测试按钮应禁用`);
+  await dom.window.eval('runCandy({ all: true })');
+  check(calls.filter((call) => call.path === "api" + route).length === before + 1, `${route} pending 期间不得重复提交`);
+  finish();
+  if (action) await action;
+  await until(() => !runButton.disabled, `${route} 完成后未恢复按钮`);
+  check(flash().includes("已结束") && $("flash").dataset.tone === "info", `${route} 完成后必须显示结束通知，而非启动/黄色告警`);
+  check(!flash().includes("跳过") && !flash().includes("仍会尝试"), `${route} 完成后仍包含空数组的伪警告`);
+}
+mockRunGate = null;
+mockRunStatus = 503;
+mockRunResponse = { error: { message: "模拟执行请求失败" } };
+await dom.window.eval('runCandy({ all: true })');
+check($("flash").dataset.tone === "error" && flash().includes("模拟执行请求失败"), "请求失败必须保留真实错误提示");
+check(!flash().includes("已结束"), "失败请求不能生成完成提示");
+mockRunStatus = 200;
+for (const call of calls) {
+  const route = `${call.method} ${call.path}`;
+  check(registered.has(route), `未注册的运行/轮询路由：${route}`);
+  callsSeen.add(route);
+}
 for (const error of errors) fail(`页面抛出异常：${error}`);
 // 关闭页面轮询与三个 jsdom 窗口，避免校验通过后进程仍常驻。
 dom.window.close();

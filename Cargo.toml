@@ -1,6 +1,6 @@
 [package]
 name = "codex-proxy-plugin-candy-eval"
-version = "1.0.9"
+version = "1.0.13"
 edition = "2021"
 
 [lib]
@@ -15,7 +15,7 @@ path = "src/main.rs"
 gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", tag = "v3.26.1", features = ["io"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }

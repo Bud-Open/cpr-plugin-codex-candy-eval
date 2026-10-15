@@ -15,6 +15,7 @@ pub mod modeltrace;
 pub mod pelican;
 pub mod runs;
 pub mod state;
+pub mod storage;
 
 pub use app::plugin;
 pub use manifest::{manifest, PLUGIN_ID};

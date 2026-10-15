@@ -19,6 +19,8 @@ body {
 }
 .mono, .markdown code { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 main { display: flow-root; min-height: 100dvh; max-width: var(--page-width); margin: 0 auto; padding-top: var(--page-top); }
+/* The host sizes its iframe from body height: viewport minima plus a footer recurse forever. */
+:root[data-cpr-plugin-host] main { min-height: 0; }
 .page-footer { display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 0; padding: 24px 12px max(32px, env(safe-area-inset-bottom)); color: var(--faint); font-size: 11px; }
 .page-footer span { white-space: nowrap; }
 .page-footer a { color: inherit; text-decoration: none; }
@@ -284,14 +286,14 @@ dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--d
 dialog::backdrop { background: rgb(0 0 0 / 35%); }
 /* 宿主沙箱禁用 modal：非模态对话框由脚本自带遮罩与居中定位。 */
 .dialog-backdrop { position: fixed; inset: 0; z-index: 60; background: rgb(0 0 0 / 35%); }
-dialog[open] { position: fixed; inset: 0; z-index: 61; margin: auto; }
+dialog[open] { position: fixed; inset: auto; top: var(--dialog-top, 50%); left: var(--dialog-left, 50%); z-index: 61; margin: 0; transform: translate(-50%, -50%); max-width: var(--dialog-max-width, calc(100vw - 32px)); max-height: var(--dialog-max-height, calc(100dvh - 32px)); overflow: auto; }
 .confirm { width: min(400px, calc(100vw - 32px)); padding: 22px; }
 .confirm h2 { margin: 0 0 6px; font-size: 16px; }
 .confirm p { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .dialog-actions .btn { height: 34px; }
-/* Centered dialogs leave 80px above the header for CPA's floating controls. */
-.result-dialog { --dialog-padding: 22px; width: min(920px, calc(100vw - 32px)); max-height: calc(100dvh - 160px); padding: 0; border-radius: 16px; }
+/* Embedded dialogs use the visible parent viewport, not the entire content-sized iframe. */
+.result-dialog { --dialog-padding: 22px; width: min(920px, calc(100vw - 32px)); max-height: var(--dialog-max-height, calc(100dvh - 160px)); padding: 0; border-radius: 16px; }
 .result-dialog-head { --heading-padding: 18px var(--dialog-padding); --heading-size: 18px; position: sticky; top: 0; z-index: 1; background: var(--dialog-bg); backdrop-filter: var(--glass); }
 .result-dialog-body { padding: var(--dialog-padding); }
 .result-dialog-meta { margin: 0 0 18px; color: var(--muted); font-size: 12px; }

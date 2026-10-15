@@ -85,6 +85,16 @@ def switch(instance, digest):
         {'id': instance['id'], 'target': {'artifactSha256': digest, 'expectedRevision': instance['revision']}})
 
 
+def require_idle(instance):
+    state = api('/api/admin/plugins/extensions/{}/{}/{}/api/api/state'.format(
+        instance['id'], instance['artifactSha256'], instance['revision']))
+    rows = state.get('auths') if isinstance(state, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError('plugin_state_schema_unrecognized')
+    if any(bool(value) for row in rows for key, value in row.items()
+           if key == 'running' or key.endswith('_running')):
+        raise RuntimeError('tests_in_progress')
+
 def private_backup(instance):
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     backup = Path('/root/cpr-candy-backups') / ('ui-' + stamp)
@@ -127,7 +137,7 @@ def package_version(package):
     return match.group(1)
 
 
-def deploy(package, expected):
+def deploy(package, expected, allow_inflight=False):
     if package.is_symlink() or not package.is_file() or not re.fullmatch(r'[a-f0-9]{64}', expected):
         raise RuntimeError('invalid_package_input')
     version = package_version(package)
@@ -135,6 +145,10 @@ def deploy(package, expected):
     if hashlib.sha256(body).hexdigest() != expected:
         raise RuntimeError('package_hash_mismatch')
     previous = current()
+    if not allow_inflight:
+        require_idle(previous)
+    else:
+        print(json.dumps({'phase': 'authorization', 'inflight_interruption_authorized': True}), flush=True)
     verified = api('/api/admin/plugins/artifacts/upload/verify', 'POST', body, raw=True)
     metadata = verified['metadata']
     if metadata['pluginId'] != PLUGIN or metadata['version'] != version or metadata['sha256'] != expected:
@@ -152,6 +166,8 @@ def deploy(package, expected):
         latest = current()
         if latest['id'] != previous['id'] or latest['artifactSha256'] != previous['artifactSha256']:
             raise RuntimeError('concurrent_instance_change')
+        if not allow_inflight:
+            require_idle(latest)  # Default: never interrupt a test started during backup/upload.
         changed = True  # Also reconcile a lost response after a committed switch.
         switch(latest, expected)
         running = current()
@@ -180,9 +196,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('package', type=Path)
     parser.add_argument('sha256')
+    parser.add_argument('--allow-inflight', action='store_true',
+        help='Allow interruption of running tests only with explicit operator authorization')
     arguments = parser.parse_args()
     try:
-        deploy(arguments.package, arguments.sha256)
+        deploy(arguments.package, arguments.sha256, allow_inflight=arguments.allow_inflight)
     except Exception as error:
         print(json.dumps({'ok': False, 'error_class': type(error).__name__, 'http_status': error.code if isinstance(error, urllib.error.HTTPError) else None}), flush=True)
         raise SystemExit(1)

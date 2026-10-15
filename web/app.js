@@ -281,29 +281,41 @@ async function load({ refresh = false, quiet = false } = {}) {
   }
 }
 
+// CPR 的 /run 在当前管理调用作用域内执行完毕才返回；started 是执行过的凭证数，
+// 不是异步任务的启动确认。其余字段是账号 ID 数组，不能按 truthiness 判断或直接拼接。
+function runResponseNotice(response) {
+  const count = (value) => Array.isArray(value) ? value.length : Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const started = count(response?.started), skipped = count(response?.skipped);
+  const unchecked = count(response?.unchecked), busy = count(response?.busy);
+  const messages = [started ? `本轮测试已结束：${started} 个凭证，结果见历史记录` : "本轮未执行新的测试"];
+  if (skipped) messages.push(`${skipped} 个凭证不可用或已停用，已跳过`);
+  if (unchecked) messages.push(`${unchecked} 个凭证未确认支持所选模型，已跳过`);
+  if (busy) messages.push(`${busy} 个凭证已有任务，已跳过`);
+  return { message: messages.join("；"), tone: !started || skipped || unchecked || busy ? "warning" : "info" };
+}
+
 async function update(path, options, errorPrefix) {
   if (pending) return;
+  const isRun = path.endsWith("/run");
   pending = true;
   stopPolling();
-  setNotice("flash", "");
+  setNotice("flash", isRun ? "正在准备测试请求…" : "", "info");
   render();
   // 采集在插件内同步执行，期间必须继续拉状态，否则按钮一直停在“测试”看不出已开始。
   const watch = watchWhilePending();
   try {
-    if (path.endsWith("/run")) {
+    if (isRun) {
       await refreshCatalog();
       fillModels();
       setNotice("catalog-error", "");
       if (!catalogCache.models?.ids.includes(options.body.model)) throw new Error("所选模型已不在模型列表中，请重新选择。");
       options.body.model_catalog = await modelCatalog(options.body.auth_ids || []);
+      setNotice("flash", "测试请求已提交，等待执行结果；进度请查看列表。", "info");
     }
     const response = await api(BASE + path, options);
-    if (path.endsWith("/run")) {
-      const messages = [`已为 ${response.started || 0} 个凭证开始测试`];
-      if (response.skipped) messages.push(`${response.skipped} 个凭证不支持所选模型，已跳过`);
-      if (response.unchecked) messages.push(`${response.unchecked} 个凭证无法读取模型列表，仍会尝试测试`);
-      if (response.busy) messages.push(`${response.busy} 个凭证正在测试，已跳过`);
-      setNotice("flash", messages.join("；"), response.unchecked ? "warning" : "info");
+    if (isRun) {
+      const notice = runResponseNotice(response);
+      setNotice("flash", notice.message, notice.tone);
     }
   } catch (err) {
     if (err instanceof AuthError) return showLogin(err.message);
@@ -431,7 +443,7 @@ function bindCollectionActions({ type, scope, expanded, renderRows, run, showDet
   const rows = $(type + "-rows"), dialog = $(type + "-detail");
   $(type + "-detail-close").addEventListener("click", () => dialog.close());
   dialog.addEventListener("close", () => {
-    rows.querySelector(`[data-${type}-detail="${CSS.escape(dialog.dataset.record)}"][data-${type}-credential="${CSS.escape(dialog.dataset.credential)}"]`)?.focus();
+    rows.querySelector(`[data-${type}-detail="${CSS.escape(dialog.dataset.record)}"][data-${type}-credential="${CSS.escape(dialog.dataset.credential)}"]`)?.focus({ preventScroll: true });
   });
   rows.addEventListener("click", (e) => {
     if (e.target.closest("label")) return;

@@ -6,6 +6,8 @@
 # 构建与测试产生的临时文件
 *.tmp
 *.log
+__pycache__/
+*.py[cod]
 
 # 编辑器/系统
 .DS_Store

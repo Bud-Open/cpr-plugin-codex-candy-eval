@@ -9,6 +9,7 @@
   ["PATCH", "v0/management/auth-files/status"],
   ["POST", "api/credentials/sync"],
   ["GET", "api/state"],
+  ["POST", "api/storage/recover"],
   ["POST", "api/run"],
   ["DELETE", "api/results"],
   ["POST", "api/fingerprint/run"],
