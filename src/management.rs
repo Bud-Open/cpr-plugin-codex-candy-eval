@@ -129,6 +129,20 @@ pub async fn handle(
     let method = request.method.to_uppercase();
     let path = request.path.trim_matches('/').to_owned();
     let query = parse_query(&request.query);
+    // 新的后台用法必须得到宿主确认；旧版直接调用保留前台契约。
+    if query.contains_key("__cpr_background")
+        && !request.headers.iter().any(|header| {
+            header
+                .name
+                .eq_ignore_ascii_case("x-cpr-management-background")
+                && header.value == b"1"
+        })
+    {
+        return json_reply(
+            412,
+            &json!({"error": "当前 CPR 宿主尚不支持后台评测，请先部署后台调用补丁"}),
+        );
+    }
 
     state.ensure_loaded(host).await;
 
@@ -440,10 +454,10 @@ async fn run_candy(
     let mut started = 0usize;
     let mut busy = Vec::new();
     for credential in targets {
-        if state.busy(&credential.id).await {
+        let Some(lease) = state.acquire_run(&credential.id).await else {
             busy.push(credential.id.clone());
             continue;
-        }
+        };
         started += 1;
         state
             .set_running(
@@ -455,7 +469,11 @@ async fn run_candy(
             )
             .await;
         for index in 0..runs {
-            let record = candy::evaluate(host, &credential, &model, &effort).await;
+            let record = tokio::select! {
+                biased;
+                _ = lease.cancelled() => break,
+                record = candy::evaluate(host, &credential, &model, &effort) => record,
+            };
             state.push_candy(host, &credential.id, record).await;
             state
                 .set_running(
@@ -467,7 +485,7 @@ async fn run_candy(
                 )
                 .await;
         }
-        state.set_running(&credential.id, None).await;
+        lease.finish().await;
     }
 
     json_reply(
@@ -506,15 +524,21 @@ async fn run_pelican(
     let mut started = 0usize;
     let mut busy = Vec::new();
     for credential in targets {
-        if state.busy(&credential.id).await {
+        let Some(lease) = state.acquire_run(&credential.id).await else {
             busy.push(credential.id.clone());
             continue;
-        }
+        };
         started += 1;
         state.set_pelican_running(&credential.id, true).await;
-        let record = pelican::evaluate(host, &credential, &model, &effort).await;
-        state.push_pelican(host, &credential.id, record).await;
-        state.set_pelican_running(&credential.id, false).await;
+        let record = tokio::select! {
+            biased;
+            _ = lease.cancelled() => None,
+            record = pelican::evaluate(host, &credential, &model, &effort) => Some(record),
+        };
+        if let Some(record) = record {
+            state.push_pelican(host, &credential.id, record).await;
+        }
+        lease.finish().await;
     }
 
     json_reply(
@@ -562,12 +586,13 @@ async fn run_fingerprint(
     let mut started = 0usize;
     let mut busy = Vec::new();
     for credential in targets {
-        if state.busy(&credential.id).await {
+        let Some(lease) = state.acquire_run(&credential.id).await else {
             busy.push(credential.id.clone());
             continue;
-        }
+        };
         started += 1;
         crate::runs::fingerprint_run(state, host, &credential, &model, &mode, concurrency).await;
+        lease.finish().await;
     }
 
     json_reply(
@@ -612,12 +637,13 @@ async fn run_modeltrace(
     let mut started = 0usize;
     let mut busy = Vec::new();
     for credential in targets {
-        if state.busy(&credential.id).await {
+        let Some(lease) = state.acquire_run(&credential.id).await else {
             busy.push(credential.id.clone());
             continue;
-        }
+        };
         started += 1;
         crate::runs::modeltrace_run(state, host, &credential, &model, concurrency).await;
+        lease.finish().await;
     }
 
     json_reply(

@@ -71,8 +71,7 @@ document.addEventListener("keydown", (event) => {
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
 });
 
-// 宿主桥自身没有超时；请求悬挂时 pending 会永远为真，整页按钮都以「正在处理上一个操作」
-// 静默禁用，看不出任何原因。给每次桥调用加时限，到点让调用方拿到明确错误。
+// 状态、停止等短调用设本地时限；评测由宿主保留作用域，不以页面 60 秒计时器中止等待。
 const REQUEST_TIMEOUT_MS = 60000;
 
 function withDeadline(promise, ms = REQUEST_TIMEOUT_MS) {
@@ -90,6 +89,10 @@ function bridgeRoute(path) {
 async function api(path, { method = "GET", body, apiKey, signal } = {}) {
   if (signal?.aborted) throw signal.reason;
   const [routePath, query = ""] = path.split("?", 2);
+  const route = bridgeRoute(routePath);
+  const background = method === "POST" && /^api\/(?:run|(?:modeltrace|pelican|fingerprint)\/run|inspection)$/.test(route);
+  const parameters = new URLSearchParams(query);
+  if (background) parameters.set("__cpr_background", "1");
   let payload, contentType;
   if (body !== undefined) {
     contentType = "application/json";
@@ -97,7 +100,8 @@ async function api(path, { method = "GET", body, apiKey, signal } = {}) {
   }
   let result;
   try {
-    result = await withDeadline(bridge.request({ method, path: bridgeRoute(routePath), query, contentType, body: payload }));
+    const request = bridge.request({ method, path: route, query: parameters.toString(), contentType, body: payload });
+    result = await (background ? request : withDeadline(request));
   } catch (err) {
     if (signal?.aborted) throw signal.reason;
     throw new Error(String(err?.message || err).slice(0, 500));

@@ -81,6 +81,7 @@ const entry = "web/ui.html";
 const entryBody = buildPage(root);
 resources.set(entry, { mime: "text/html", body: Buffer.from(entryBody) });
 const document = new JSDOM(entryBody).window.document;
+check(document.querySelector("footer")?.textContent.includes(`版本 v${manifest.version}`), "页脚必须显示实际插件版本，不能保留上游 v1.0.0");
 check(![...resources.keys()].some((resource) => resource.endsWith(".js")), "发布清单不能预取独立脚本资源");
 check(!document.querySelector("script[src]"), "发布入口必须内联全部脚本");
 check(Buffer.byteLength(entryBody) <= 1024 * 1024, "发布入口超过 CPR 1 MiB 限制");
@@ -376,6 +377,8 @@ for (const route of ["/run", "/modeltrace/run", "/pelican/run"]) {
   else action = dom.window.eval(`update(${JSON.stringify(route)}, { method: "POST", body: { auth_ids: ["acct-1"], model: "gpt-6.1-sol" } }, "开始测试失败")`);
   check(!$("flash").hidden && flash().includes("正在准备"), `${route} 点击后应立即显示准备提示`);
   await until(() => calls.filter((call) => call.path === "api" + route).length > before, `${route} 未提交运行请求`);
+  const submitted = calls.filter((call) => call.path === "api" + route).at(-1);
+  check(new URLSearchParams(submitted.query).get("__cpr_background") === "1", `${route} 必须明确请求宿主保留后台作用域`);
   check($("flash").dataset.tone === "info" && flash().includes("等待执行结果"), `${route} 响应前应显示普通执行提示`);
   check(!flash().includes("已结束"), `${route} 响应前不能提前宣称测试结束`);
   check(runButton.disabled, `${route} 运行期间测试按钮应禁用`);
@@ -397,6 +400,9 @@ mockRunStatus = 200;
 for (const call of calls) {
   const route = `${call.method} ${call.path}`;
   check(registered.has(route), `未注册的运行/轮询路由：${route}`);
+  if (call.method !== "POST" || !call.path.endsWith("/run")) {
+    check(!new URLSearchParams(call.query).has("__cpr_background"), "短管理请求不得默认改成后台执行");
+  }
   callsSeen.add(route);
 }
 for (const error of errors) fail(`页面抛出异常：${error}`);

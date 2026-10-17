@@ -4,7 +4,7 @@
 //! 底层索引最后 CAS 提交；保存串行化，读取或校验失败时不覆盖原记录。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use gateway_plugin_sdk::call::host::StatePutResult;
 use gateway_plugin_sdk::client::HostClient;
@@ -32,6 +32,8 @@ struct Inner {
     pelican_running: BTreeSet<String>,
     fingerprint_running: BTreeMap<String, FingerprintProgress>,
     trace_running: BTreeMap<String, TraceProgress>,
+    /// 活跃执行者的所有权标记；取得标记与忙碌判断在同一写锁内完成。
+    leases: BTreeMap<String, Weak<()>>,
     /// 已请求取消的凭证；采集循环在每个样本前检查。
     cancelled: BTreeSet<String>,
     /// 最近一次巡检结果。
@@ -56,12 +58,93 @@ impl Default for StateManager {
     }
 }
 
+/// 执行者退出（包括宿主取消、超时和 panic）时必须归还运行状态。
+/// 不持有 HostClient；清理只改内存，已经保存的历史保持不变。
+pub struct RunLease {
+    state: StateManager,
+    id: String,
+    token: Arc<()>,
+    armed: bool,
+}
+
+impl RunLease {
+    pub async fn finish(mut self) {
+        clear_owned_run(&mut *self.state.inner.write().await, &self.id, &self.token);
+        self.armed = false;
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            if self.state.is_cancelled(&self.id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl Drop for RunLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut inner) = self.state.inner.try_write() {
+            clear_owned_run(&mut inner, &self.id, &self.token);
+            return;
+        }
+        // Drop 不能等待锁；锁被状态查询占用时，将同一所有权清理交给运行时。
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (state, id, token) = (self.state.clone(), self.id.clone(), self.token.clone());
+            runtime.spawn(async move {
+                clear_owned_run(&mut *state.inner.write().await, &id, &token);
+            });
+        }
+    }
+}
+
+fn clear_owned_run(inner: &mut Inner, id: &str, token: &Arc<()>) {
+    if !inner
+        .leases
+        .get(id)
+        .is_some_and(|owner| owner.ptr_eq(&Arc::downgrade(token)))
+    {
+        return;
+    }
+    inner.running.remove(id);
+    inner.pelican_running.remove(id);
+    inner.fingerprint_running.remove(id);
+    inner.trace_running.remove(id);
+    inner.cancelled.remove(id);
+    inner.leases.remove(id);
+}
+
 impl StateManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner::default())),
             storage_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub async fn acquire_run(&self, id: &str) -> Option<RunLease> {
+        let mut inner = self.inner.write().await;
+        if inner.leases.contains_key(id)
+            || inner.running.contains_key(id)
+            || inner.pelican_running.contains(id)
+            || inner.fingerprint_running.contains_key(id)
+            || inner.trace_running.contains_key(id)
+        {
+            return None;
+        }
+        let token = Arc::new(());
+        inner.leases.insert(id.to_owned(), Arc::downgrade(&token));
+        inner.cancelled.remove(id);
+        Some(RunLease {
+            state: self.clone(),
+            id: id.to_owned(),
+            token,
+            armed: true,
+        })
     }
 
     /// 首次访问时从宿主读取持久化状态；损坏时只记录错误，不阻塞页面。
@@ -356,7 +439,8 @@ impl StateManager {
     /// 某凭证是否已有测试在进行中。
     pub async fn busy(&self, id: &str) -> bool {
         let inner = self.inner.read().await;
-        inner.running.contains_key(id)
+        inner.leases.contains_key(id)
+            || inner.running.contains_key(id)
             || inner.pelican_running.contains(id)
             || inner.fingerprint_running.contains_key(id)
             || inner.trace_running.contains_key(id)
@@ -661,6 +745,119 @@ fn drop_oldest<T>(map: &mut BTreeMap<String, Vec<T>>, id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_lease_atomically_excludes_duplicate_starts() {
+        let state = StateManager::new();
+        let (first, second) = tokio::join!(
+            state.acquire_run("fixture-account"),
+            state.acquire_run("fixture-account")
+        );
+        assert_ne!(first.is_some(), second.is_some());
+        let lease = first.or(second).unwrap();
+        assert!(state.busy("fixture-account").await);
+        lease.finish().await;
+        assert!(!state.busy("fixture-account").await);
+        assert!(state.acquire_run("fixture-account").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn aborted_executor_releases_all_progress_and_cancel_state() {
+        let state = StateManager::new();
+        let lease = state.acquire_run("fixture-account").await.unwrap();
+        state
+            .set_running("fixture-account", Some(RunProgress { done: 0, total: 3 }))
+            .await;
+        state.set_pelican_running("fixture-account", true).await;
+        state
+            .set_fingerprint_running(
+                "fixture-account",
+                Some(FingerprintProgress {
+                    model: "fixture-model".into(),
+                    mode: "quick".into(),
+                    done: 0,
+                    total: 3,
+                    valid: 0,
+                    errors: 0,
+                    phase: "collecting".into(),
+                    concurrency: 3,
+                }),
+            )
+            .await;
+        state
+            .set_trace_running(
+                "fixture-account",
+                Some(TraceProgress {
+                    model: "fixture-model".into(),
+                    phase: "collecting".into(),
+                    done: 0,
+                    concurrency: 3,
+                }),
+            )
+            .await;
+        state.cancel("fixture-account").await;
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!state.busy("fixture-account").await);
+        assert!(!state.is_cancelled("fixture-account").await);
+        let inner = state.inner.read().await;
+        assert!(inner.running.is_empty() && inner.pelican_running.is_empty());
+        assert!(inner.fingerprint_running.is_empty() && inner.trace_running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_executor_cleanup_waits_for_a_busy_state_lock() {
+        let state = StateManager::new();
+        let lease = state.acquire_run("fixture-account").await.unwrap();
+        let lock = state.inner.read().await;
+        drop(lease);
+        assert!(lock.leases.contains_key("fixture-account"));
+        drop(lock);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.busy("fixture-account").await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.acquire_run("fixture-account").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn old_executor_cleanup_cannot_clear_a_new_executor() {
+        let state = StateManager::new();
+        let old = state.acquire_run("fixture-account").await.unwrap();
+        clear_owned_run(
+            &mut *state.inner.write().await,
+            "fixture-account",
+            &old.token,
+        );
+        let new = state.acquire_run("fixture-account").await.unwrap();
+        state
+            .set_running("fixture-account", Some(RunProgress { done: 1, total: 3 }))
+            .await;
+        drop(old);
+        assert!(state.busy("fixture-account").await);
+        assert_eq!(state.inner.read().await.running["fixture-account"].done, 1);
+        new.finish().await;
+        assert!(!state.busy("fixture-account").await);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_stop_is_observed_without_waiting_for_upstream() {
+        let state = StateManager::new();
+        let lease = state.acquire_run("fixture-account").await.unwrap();
+        state.cancel("fixture-account").await;
+        tokio::time::timeout(std::time::Duration::from_millis(100), lease.cancelled())
+            .await
+            .unwrap();
+        lease.finish().await;
+        assert!(!state.is_cancelled("fixture-account").await);
+    }
 
     fn candy(answer: &str) -> CandyResult {
         CandyResult {

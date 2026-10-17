@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 export function buildPage(root) {
   const web = path.join(path.resolve(root), 'web');
-  const template = readFileSync(path.join(web, 'ui.html'), 'utf8');
+  const { version } = JSON.parse(readFileSync(path.join(root, 'plugin.json'), 'utf8'));
+  const template = readFileSync(path.join(web, 'ui.html'), 'utf8').replaceAll('{{PLUGIN_VERSION}}', version);
   const html = template.replace(/<script\s+src="([^"]+)"\s*><\/script>/g, (_tag, source) => {
     const filename = path.resolve(web, source);
     if (!filename.startsWith(web + path.sep) || !source.endsWith('.js')) {

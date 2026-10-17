@@ -1,7 +1,7 @@
 //! 采集编排：指纹与深度追踪的并发探测、取消响应，以及定时巡检入口。
 //!
-//! 管理调用有 3 分钟预算，因此每个凭证的采集都在本次调用内同步完成，
-//! 并通过并发度与超时预算保证不会无限占用。
+//! 采集在宿主保留的调用作用域内完成；后台模式的 HTTP 等待者可离开，
+//! 模型权限、并发和调用预算仍受宿主约束。执行者的运行标记由 RunLease 统一归还。
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,7 +80,6 @@ pub async fn fingerprint_run(
             }),
         )
         .await;
-    state.clear_cancel(&credential.id).await;
 
     let started = std::time::Instant::now();
     let probes = fingerprint::probes();
@@ -316,7 +315,6 @@ pub async fn modeltrace_run(
             }),
         )
         .await;
-    state.clear_cancel(&credential.id).await;
 
     let started = std::time::Instant::now();
     let challenges = Arc::new(modeltrace::challenges());
@@ -511,8 +509,19 @@ pub async fn inspect(state: &Arc<StateManager>, host: &HostClient) -> serde_json
     let mut errored = 0usize;
 
     for credential in credentials.iter().filter(|credential| !credential.disabled) {
-        let record = candy::evaluate(host, credential, INSPECT_MODEL, "low").await;
+        let Some(lease) = state.acquire_run(&credential.id).await else {
+            continue;
+        };
+        state
+            .set_running(&credential.id, Some(idle_progress(1)))
+            .await;
+        let record = tokio::select! {
+            biased;
+            _ = lease.cancelled() => { lease.finish().await; continue; },
+            record = candy::evaluate(host, credential, INSPECT_MODEL, "low") => record,
+        };
         state.push_candy(host, &credential.id, record.clone()).await;
+        lease.finish().await;
         if record.skipped {
             continue;
         }

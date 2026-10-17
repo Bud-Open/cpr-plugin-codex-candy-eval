@@ -1,6 +1,6 @@
 {
   "name": "cpr-plugin-codex-candy-eval",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "private": true,
   "description": "CPR (codex-proxy-rs) 原生糖果自检插件的页面契约测试与前端构建工具依赖",
   "license": "MIT",
