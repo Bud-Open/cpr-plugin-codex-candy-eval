@@ -56,6 +56,7 @@ pub fn registration() -> ManagementRegistration {
             json("GET", "api/state"),
             json_body("POST", "api/storage/recover"),
             json_body("POST", "api/run"),
+            json_body("POST", "api/cancel"),
             json("DELETE", "api/results"),
             json_body("POST", "api/fingerprint/run"),
             json_body("POST", "api/fingerprint/cancel"),
@@ -66,6 +67,7 @@ pub fn registration() -> ManagementRegistration {
             json("GET", "api/modeltrace/record"),
             json("DELETE", "api/modeltrace/results"),
             json_body("POST", "api/pelican/run"),
+            json_body("POST", "api/pelican/cancel"),
             json("GET", "api/pelican/record"),
             json("DELETE", "api/pelican/results"),
             json("DELETE", "api/all/results"),
@@ -93,21 +95,21 @@ pub fn registration() -> ManagementRegistration {
 // ------------------------------------------------------------ 请求体
 
 #[derive(Debug, Default, Deserialize)]
-struct RunRequest {
+pub(crate) struct RunRequest {
     #[serde(default)]
     auth_ids: Vec<String>,
     #[serde(default)]
     all: bool,
     #[serde(default)]
-    model: String,
+    pub(crate) model: String,
     #[serde(default)]
-    effort: String,
+    pub(crate) effort: String,
     #[serde(default)]
-    runs: u32,
+    pub(crate) runs: u32,
     #[serde(default)]
-    mode: String,
+    pub(crate) mode: String,
     #[serde(default)]
-    concurrency: u32,
+    pub(crate) concurrency: u32,
     #[serde(default)]
     model_catalog: BTreeMap<String, Vec<String>>,
 }
@@ -124,27 +126,32 @@ pub async fn handle(
     state: &Arc<StateManager>,
     call: TypedCall<gateway_plugin_sdk::call::management::ManagementRequest>,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
+    handle_with_config(state, call, &json!({})).await
+}
+
+pub async fn handle_with_config(
+    state: &Arc<StateManager>,
+    call: TypedCall<gateway_plugin_sdk::call::management::ManagementRequest>,
+    config: &serde_json::Value,
+) -> Result<TypedReply<ManagementResponse>, PluginFault> {
     let request = call.request;
     let host = &call.host;
     let method = request.method.to_uppercase();
     let path = request.path.trim_matches('/').to_owned();
     let query = parse_query(&request.query);
-    // 新的后台用法必须得到宿主确认；旧版直接调用保留前台契约。
-    if query.contains_key("__cpr_background")
-        && !request.headers.iter().any(|header| {
-            header
-                .name
-                .eq_ignore_ascii_case("x-cpr-management-background")
-                && header.value == b"1"
-        })
-    {
-        return json_reply(
-            412,
-            &json!({"error": "当前 CPR 宿主尚不支持后台评测，请先部署后台调用补丁"}),
-        );
-    }
-
     state.ensure_loaded(host).await;
+    state.flush_pending(host).await;
+    // Explicit opt-in preserves the synchronous contract of existing API/CLI callers.
+    if method == "POST"
+        && matches!(
+            path.as_str(),
+            "api/run" | "api/modeltrace/run" | "api/pelican/run" | "api/fingerprint/run"
+        )
+        && (query.get("background").is_some_and(|value| value == "1")
+            || query.contains_key("__cpr_background"))
+    {
+        return crate::background::submit(state, host, config, &path, &call.payload).await;
+    }
 
     match (method.as_str(), path.as_str()) {
         // ---------------------------------------------- CPA 管理接口适配
@@ -203,6 +210,10 @@ pub async fn handle(
 
         // ---------------------------------------------- 糖果测试
         ("POST", "api/run") => run_candy(state, host, &call.payload).await,
+        ("POST", "api/cancel" | "api/pelican/cancel") => {
+            state.cancel(&body_id(&call.payload)).await;
+            json_reply(200, &json!({"cancelled":true}))
+        }
         ("DELETE", "api/results") => clear(state, host, "candy").await,
 
         // ---------------------------------------------- 鹈鹕测试
@@ -289,7 +300,7 @@ fn to_credential(
     }
 }
 
-async fn refresh_credentials(
+pub(crate) async fn refresh_credentials(
     state: &StateManager,
     host: &HostClient,
 ) -> Result<usize, PluginFault> {
@@ -378,7 +389,7 @@ async fn clear(
 // ------------------------------------------------------------ 目标解析
 
 /// 解析本次要测试的凭证；返回 (已启动, 跳过, 未勾选)。
-fn select(
+pub(crate) fn select(
     state_credentials: &[crate::model::Credential],
     request: &RunRequest,
 ) -> (Vec<crate::model::Credential>, Vec<String>, Vec<String>) {

@@ -144,6 +144,7 @@ let mockAnswers = [true, false, true];
 // /run 的真实 CPR 契约：started 为整数，另外三项为账号 ID 数组。
 let mockRunResponse = { started: 1, skipped: [], unchecked: [], busy: [] };
 let mockRunGate = null, mockRunStatus = 200;
+let mockRunning = {};
 
 function mockBackend(call) {
   // 真实插件状态里失败记录的字段集：没有 attribution，samples 为空数组。
@@ -166,6 +167,11 @@ function mockBackend(call) {
     "POST api/run": () => mockRunResponse,
     "POST api/modeltrace/run": () => mockRunResponse,
     "POST api/pelican/run": () => mockRunResponse,
+    "POST api/fingerprint/run": () => mockRunResponse,
+    "POST api/cancel": () => { mockRunning = {}; return { cancelled: true }; },
+    "POST api/pelican/cancel": () => { mockRunning = {}; return { cancelled: true }; },
+    "POST api/fingerprint/cancel": () => { mockRunning = {}; return { status: "cancelling" }; },
+    "POST api/modeltrace/cancel": () => { mockRunning = {}; return { status: "cancelling" }; },
     "GET api/modeltrace/record": () => mtRecord,
   };
   if (`${call.method} ${call.path}` === "GET api/state") {
@@ -174,7 +180,7 @@ function mockBackend(call) {
       effort: "low", ok, answer: ok ? "21" : "22", error: "", input_tokens: 10,
       output_tokens: 5, reasoning_tokens: 0, duration_ms: 1200,
     }));
-    return { status: 200, body: { auths: [{ ...credential, results }], models: ["gpt-6.1-sol"], storage_error: "", version: "1.0.0" } };
+    return { status: 200, body: { auths: [{ ...credential, results, ...mockRunning }], models: ["gpt-6.1-sol"], storage_error: "", version: "1.0.0" } };
   }
   const handler = routes[`${call.method} ${call.path}`];
   if (!handler) return { status: 404, body: { error: { message: `未注册路由：${call.method} ${call.path}` } } };
@@ -208,7 +214,7 @@ const bridgeSource = `
     callbackTicket() { return Promise.reject(new Error("未使用")); },
     models: Object.freeze({ responses() { return Promise.reject(new Error("未使用")); } }),
     request(input) {
-      const call = { method: String(input.method || "").toUpperCase(), path: String(input.path || ""), query: input.query == null ? "" : String(input.query) };
+      const call = { method: String(input.method || "").toUpperCase(), path: String(input.path || ""), query: input.query == null ? "" : String(input.query), body: input.body ? JSON.parse(new TextDecoder().decode(input.body)) : null };
       window.__calls.push(call);
       return Promise.resolve(window.__backend(call)).then((answer) => ({
         status: answer.status,
@@ -368,7 +374,9 @@ const until = async (predicate, label) => {
 const flash = () => $("flash").querySelector(".notice-message").textContent;
 const runButton = $("run-batch");
 check(runButton && !runButton.disabled, "测试按钮应可用");
-for (const route of ["/run", "/modeltrace/run", "/pelican/run"]) {
+for (const queued of [false, true]) {
+ for (const route of ["/run", "/modeltrace/run", "/pelican/run", "/fingerprint/run"]) {
+  mockRunResponse = { queued, started: 1, skipped: [], unchecked: [], busy: [] };
   let finish;
   mockRunGate = new Promise((resolve) => { finish = resolve; });
   const before = calls.filter((call) => call.path === "api" + route).length;
@@ -378,8 +386,8 @@ for (const route of ["/run", "/modeltrace/run", "/pelican/run"]) {
   check(!$("flash").hidden && flash().includes("正在准备"), `${route} 点击后应立即显示准备提示`);
   await until(() => calls.filter((call) => call.path === "api" + route).length > before, `${route} 未提交运行请求`);
   const submitted = calls.filter((call) => call.path === "api" + route).at(-1);
-  check(new URLSearchParams(submitted.query).get("__cpr_background") === "1", `${route} 必须明确请求宿主保留后台作用域`);
-  check($("flash").dataset.tone === "info" && flash().includes("等待执行结果"), `${route} 响应前应显示普通执行提示`);
+  check(new URLSearchParams(submitted.query).get("background") === "1" && !new URLSearchParams(submitted.query).has("__cpr_background"), `${route} 必须使用插件后台任务，不能依赖宿主补丁`);
+  check($("flash").dataset.tone === "info" && flash().includes("等待启动确认"), `${route} 响应前应显示普通准备提示`);
   check(!flash().includes("已结束"), `${route} 响应前不能提前宣称测试结束`);
   check(runButton.disabled, `${route} 运行期间测试按钮应禁用`);
   await dom.window.eval('runCandy({ all: true })');
@@ -387,8 +395,21 @@ for (const route of ["/run", "/modeltrace/run", "/pelican/run"]) {
   finish();
   if (action) await action;
   await until(() => !runButton.disabled, `${route} 完成后未恢复按钮`);
-  check(flash().includes("已结束") && $("flash").dataset.tone === "info", `${route} 完成后必须显示结束通知，而非启动/黄色告警`);
+  check(flash().includes(queued ? "已开始后台测试" : "已结束") && $("flash").dataset.tone === "info", `${route} 必须区分后台接收和同步结束`);
+  if (queued) check(!flash().includes("已结束"), `${route} 后台接收不能误报完成`);
   check(!flash().includes("跳过") && !flash().includes("仍会尝试"), `${route} 完成后仍包含空数组的伪警告`);
+}
+}
+for (const [field,value,type,path] of [["running",{done:0,total:1},"candy","api/cancel"],["pelican_running",true,"pl","api/pelican/cancel"],["fingerprint_running",{done:0,total:1},"fp","api/fingerprint/cancel"],["modeltrace_running",{done:0,total:1},"mt","api/modeltrace/cancel"]]) {
+  mockRunning = {[field]:value};
+  await dom.window.eval('load()');
+  const button = dom.window.document.querySelector(`[data-${type}-cancel="acct-1"]`);
+  check(button && !button.disabled, `${type} 后台运行时必须提供停止按钮`);
+  const before = calls.filter((call) => call.path === path).length;
+  button?.dispatchEvent(new dom.window.MouseEvent("click", {bubbles:true}));
+  await until(() => calls.filter((call) => call.path === path).length > before, `${type} 停止按钮未调用取消接口`);
+  check(calls.filter((call) => call.path === path).at(-1)?.body?.id === "acct-1", `${type} 停止请求必须使用后端 RecordQuery.id，不能只验证路由名称`);
+  await until(() => !dom.window.document.querySelector(`[data-${type}-cancel="acct-1"]`), `${type} 停止后按钮未恢复`);
 }
 mockRunGate = null;
 mockRunStatus = 503;
@@ -401,7 +422,7 @@ for (const call of calls) {
   const route = `${call.method} ${call.path}`;
   check(registered.has(route), `未注册的运行/轮询路由：${route}`);
   if (call.method !== "POST" || !call.path.endsWith("/run")) {
-    check(!new URLSearchParams(call.query).has("__cpr_background"), "短管理请求不得默认改成后台执行");
+    check(!new URLSearchParams(call.query).has("background") && !new URLSearchParams(call.query).has("__cpr_background"), "短管理请求不得默认改成后台执行");
   }
   callsSeen.add(route);
 }

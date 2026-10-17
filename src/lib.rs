@@ -3,9 +3,12 @@
 //! 移植自 cpa-plugin-codex-candy-eval：糖果降智测试、模型指纹对比、深度追踪与鹈鹕绘图测试。
 
 pub mod app;
+mod background;
+mod background_transport;
 pub mod candy;
 pub mod codex;
 pub mod command;
+pub mod execution;
 pub mod fingerprint;
 pub mod host_calls;
 pub mod management;
@@ -17,7 +20,7 @@ pub mod runs;
 pub mod state;
 pub mod storage;
 
-pub use app::plugin;
+pub use app::{plugin, plugin_with_config};
 pub use manifest::{manifest, PLUGIN_ID};
 
 /// 打包进插件包的前端静态资源；清单与注册表必须保持一致。

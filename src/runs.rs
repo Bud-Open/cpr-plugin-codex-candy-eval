@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use gateway_plugin_sdk::client::HostClient;
+use crate::execution::ExecutionContext;
 use serde_json::json;
 use tokio::sync::Semaphore;
 
@@ -58,7 +58,7 @@ struct Sample {
 
 pub async fn fingerprint_run(
     state: &Arc<StateManager>,
-    host: &HostClient,
+    host: &impl ExecutionContext,
     credential: &Credential,
     model: &str,
     mode: &fingerprint::FingerprintMode,
@@ -216,14 +216,16 @@ pub async fn fingerprint_run(
         attribution,
     };
 
-    state.set_fingerprint_running(&credential.id, None).await;
-    state.clear_cancel(&credential.id).await;
+    if host.storage_host().is_some() {
+        state.set_fingerprint_running(&credential.id, None).await;
+        state.clear_cancel(&credential.id).await;
+    }
     state.push_fingerprint(host, &credential.id, record).await;
 }
 
 async fn collect_fingerprint_sample(
     state: &Arc<StateManager>,
-    host: &HostClient,
+    host: &impl ExecutionContext,
     credential: &Credential,
     model: &str,
     probe: &fingerprint::FingerprintProbe,
@@ -298,7 +300,7 @@ async fn collect_fingerprint_sample(
 
 pub async fn modeltrace_run(
     state: &Arc<StateManager>,
-    host: &HostClient,
+    host: &impl ExecutionContext,
     credential: &Credential,
     model: &str,
     concurrency: u32,
@@ -419,11 +421,11 @@ pub async fn modeltrace_run(
     match modeltrace::analyze(&outputs) {
         Ok(attribution) => {
             record.attribution = Some(attribution);
-            if valid < target {
+            if valid < target && record.status != "cancelled" {
                 record.status = "partial".to_owned();
             }
         }
-        Err(message) => {
+        Err(message) if record.status != "cancelled" => {
             record.status = "failed".to_owned();
             record.error = record
                 .samples
@@ -432,16 +434,19 @@ pub async fn modeltrace_run(
                 .filter(|error| !error.is_empty())
                 .unwrap_or(message);
         }
+        Err(_) => {}
     }
 
-    state.set_trace_running(&credential.id, None).await;
-    state.clear_cancel(&credential.id).await;
+    if host.storage_host().is_some() {
+        state.set_trace_running(&credential.id, None).await;
+        state.clear_cancel(&credential.id).await;
+    }
     state.push_trace(host, &credential.id, record).await;
 }
 
 async fn collect_trace_sample(
     state: &Arc<StateManager>,
-    host: &HostClient,
+    host: &impl ExecutionContext,
     credential: &Credential,
     model: &str,
     challenge: &modeltrace::TraceChallenge,
@@ -501,7 +506,7 @@ async fn collect_trace_sample(
 // ------------------------------------------------------------ 定时巡检
 
 /// 对所有启用账号跑一次糖果测试，返回聚合结论（不含回答正文）。
-pub async fn inspect(state: &Arc<StateManager>, host: &HostClient) -> serde_json::Value {
+pub async fn inspect(state: &Arc<StateManager>, host: &impl ExecutionContext) -> serde_json::Value {
     let credentials = state.credentials().await;
     let mut accounts = Vec::new();
     let mut passed = 0usize;

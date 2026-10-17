@@ -11,6 +11,7 @@ use gateway_plugin_sdk::client::HostClient;
 use gateway_plugin_sdk::{ErrorCode, PluginFault};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::execution::StorageContext;
 use crate::fingerprint::FingerprintResult;
 use crate::model::*;
 use crate::modeltrace::TraceResult;
@@ -44,12 +45,16 @@ struct Inner {
     loaded: bool,
     /// 小提交索引的 CAS 版本；None 表示尚无索引（可能仍有旧 global 状态）。
     version: Option<u64>,
+    revision: u64,
+    committed_revision: u64,
+    attempted_revision: u64,
 }
 
 #[derive(Clone)]
 pub struct StateManager {
     inner: Arc<RwLock<Inner>>,
     storage_lock: Arc<Mutex<()>>,
+    commit_changed: Arc<tokio::sync::Notify>,
 }
 
 impl Default for StateManager {
@@ -123,6 +128,7 @@ impl StateManager {
         Self {
             inner: Arc::new(RwLock::new(Inner::default())),
             storage_lock: Arc::new(Mutex::new(())),
+            commit_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -447,39 +453,56 @@ impl StateManager {
     }
 
     /// 追加糖果记录并立即持久化。
-    pub async fn push_candy(&self, host: &HostClient, id: &str, record: CandyResult) {
+    pub async fn push_candy(&self, host: &impl StorageContext, id: &str, record: CandyResult) {
         {
             let mut inner = self.inner.write().await;
             append_recent(inner.results.entry(id.to_owned()).or_default(), record);
+            inner.revision += 1;
         }
-        self.persist(host).await;
+        if let Some(host) = host.storage_host() {
+            self.persist(host).await;
+        }
     }
 
     /// 追加鹈鹕记录并立即持久化。
-    pub async fn push_pelican(&self, host: &HostClient, id: &str, record: PelicanResult) {
+    pub async fn push_pelican(&self, host: &impl StorageContext, id: &str, record: PelicanResult) {
         {
             let mut inner = self.inner.write().await;
             append_recent(inner.pelicans.entry(id.to_owned()).or_default(), record);
+            inner.revision += 1;
         }
-        self.persist(host).await;
+        if let Some(host) = host.storage_host() {
+            self.persist(host).await;
+        }
     }
 
     /// 追加指纹记录并立即持久化。
-    pub async fn push_fingerprint(&self, host: &HostClient, id: &str, record: FingerprintResult) {
+    pub async fn push_fingerprint(
+        &self,
+        host: &impl StorageContext,
+        id: &str,
+        record: FingerprintResult,
+    ) {
         {
             let mut inner = self.inner.write().await;
             append_recent(inner.fingerprints.entry(id.to_owned()).or_default(), record);
+            inner.revision += 1;
         }
-        self.persist(host).await;
+        if let Some(host) = host.storage_host() {
+            self.persist(host).await;
+        }
     }
 
     /// 追加深度追踪记录并立即持久化。
-    pub async fn push_trace(&self, host: &HostClient, id: &str, record: TraceResult) {
+    pub async fn push_trace(&self, host: &impl StorageContext, id: &str, record: TraceResult) {
         {
             let mut inner = self.inner.write().await;
             append_recent(inner.traces.entry(id.to_owned()).or_default(), record);
+            inner.revision += 1;
         }
-        self.persist(host).await;
+        if let Some(host) = host.storage_host() {
+            self.persist(host).await;
+        }
     }
 
     /// 清空指定范围的历史；未知范围返回错误。
@@ -504,13 +527,40 @@ impl StateManager {
         Ok(())
     }
 
+    /// Only fresh management/maintenance scopes may flush queued background results.
+    pub async fn flush_pending(&self, host: &HostClient) {
+        let dirty = {
+            let inner = self.inner.read().await;
+            inner.revision > inner.committed_revision
+        };
+        if dirty {
+            self.persist(host).await;
+        }
+    }
+
+    /// Keep the run lease until the final snapshot has been attempted; save failures
+    /// remain visible and queued for retry rather than stranding the run forever.
+    pub async fn wait_for_commit(&self) {
+        let wanted = self.inner.read().await.revision;
+        loop {
+            let changed = self.commit_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.inner.read().await.attempted_revision >= wanted {
+                return;
+            }
+            changed.await;
+        }
+    }
     /// 快照并写入宿主；超限时裁剪最旧记录后重试，版本冲突时重读版本重试一次。
     async fn persist(&self, host: &HostClient) {
         let _save = self.storage_lock.lock().await;
-        let (value, expected_version) = {
+        let (value, expected_version, revision) = {
             let mut inner = self.inner.write().await;
             if let Some(error) = inner.load_error.clone() {
                 inner.storage_error = error;
+                inner.attempted_revision = inner.revision;
+                self.commit_changed.notify_waiters();
                 return;
             }
             let mut state = PersistedState {
@@ -528,20 +578,23 @@ impl StateManager {
             inner.pelicans = state.pelicans;
             inner.fingerprints = state.fingerprints;
             inner.traces = state.traces;
-            (value, inner.version)
+            (value, inner.version, inner.revision)
         };
 
         // 同一实例的写入串行化；CAS 冲突必须报告，不能盲目重读版本后覆盖其他更新。
         let outcome = put(host, value, expected_version).await;
 
         let mut inner = self.inner.write().await;
+        inner.attempted_revision = inner.attempted_revision.max(revision);
         inner.storage_error = match outcome {
             Ok(result) => {
                 inner.version = Some(result.version);
+                inner.committed_revision = inner.committed_revision.max(revision);
                 String::new()
             }
             Err(error) => format!("测试记录保存失败：{}", error.message),
         };
+        self.commit_changed.notify_waiters();
     }
 }
 

@@ -2,9 +2,9 @@
 //!
 //! 移植自 cpa-plugin-codex-candy-eval 的 internal/plugin/candy.go。
 
+use crate::execution::ExecutionContext;
 use crate::host_calls::{execute_probe, ModelFailure};
 use crate::model::{append_recent, CandyResult, Credential, CANDY_MAX_RUNS};
-use gateway_plugin_sdk::client::HostClient;
 
 pub const CANDY_PROMPT: &str = r#"不使用任何外部工具回答以下问题：
 
@@ -42,7 +42,7 @@ pub fn clamp_runs(runs: u32) -> u32 {
 
 /// 执行一次糖果测试并生成记录；失败时记录错误而不是中断批量执行。
 pub async fn evaluate(
-    host: &HostClient,
+    host: &impl ExecutionContext,
     credential: &Credential,
     model: &str,
     effort: &str,

@@ -25,7 +25,11 @@ const STREAM_CHUNK_BYTES: u32 = 64 * 1024;
 /// CPR 的 OpenAI Responses 协议标识；宿主与 Provider 均以 `openai` 为准。
 const OPENAI_PROTOCOL: &str = "openai";
 
-async fn metadata<I, O>(host: &HostClient, method: &str, input: &I) -> Result<O, PluginFault>
+pub(crate) async fn metadata<I, O>(
+    host: &HostClient,
+    method: &str,
+    input: &I,
+) -> Result<O, PluginFault>
 where
     I: Serialize,
     O: DeserializeOwned,
@@ -204,7 +208,7 @@ impl ModelError {
         }
     }
 
-    fn other(kind: ModelFailure, message: impl Into<String>) -> Self {
+    pub(crate) fn other(kind: ModelFailure, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -214,7 +218,7 @@ impl ModelError {
 
 /// 在指定账号上执行一次 Codex 轮次请求，读取到终态并返回回答正文。
 pub async fn execute_codex_turn(
-    host: &HostClient,
+    host: &impl crate::execution::ExecutionContext,
     account_id: &str,
     provider: &str,
     model: &str,
@@ -222,7 +226,7 @@ pub async fn execute_codex_turn(
     prompt: &str,
 ) -> Result<ModelAnswer, ModelError> {
     let turn = crate::codex::codex_turn(account_id, model, effort, prompt);
-    execute_body(host, account_id, provider, model, &turn.body).await
+    host.execute(account_id, provider, model, &turn.body).await
 }
 
 /// 按给定 Responses 请求体在指定账号上执行一次模型调用。
@@ -412,7 +416,7 @@ struct ResponseBody {
 }
 
 /// 解析 Responses 事件流，返回最终回答；同时保留推理正文与用量。
-fn parse_response(sse: &[u8], started: Instant) -> Result<ModelAnswer, ModelError> {
+pub(crate) fn parse_response(sse: &[u8], started: Instant) -> Result<ModelAnswer, ModelError> {
     let text = String::from_utf8_lossy(sse);
     let mut items: Vec<serde_json::Value> = Vec::new();
     let mut reasoning = String::new();
@@ -577,7 +581,7 @@ pub fn truncate(value: &str, maximum: usize) -> String {
 
 /// 收集类探测最多重试两次，退避 2s / 4s。
 pub async fn execute_probe(
-    host: &HostClient,
+    host: &impl crate::execution::ExecutionContext,
     account_id: &str,
     provider: &str,
     model: &str,
@@ -592,7 +596,7 @@ pub async fn execute_probe(
 
 /// 同 [`execute_probe`]，但请求体由调用方提供（指纹探测使用精简体）。
 pub async fn execute_probe_body<F>(
-    host: &HostClient,
+    host: &impl crate::execution::ExecutionContext,
     account_id: &str,
     provider: &str,
     model: &str,
@@ -607,7 +611,7 @@ where
         attempts += 1;
         let outcome = tokio::time::timeout(
             PROBE_TIMEOUT,
-            execute_body(host, account_id, provider, model, &body()),
+            host.execute(account_id, provider, model, &body()),
         )
         .await;
         let outcome = match outcome {

@@ -2,9 +2,9 @@
 //!
 //! 移植自 cpa-plugin-codex-candy-eval 的 internal/plugin/pelican.go。
 
+use crate::execution::ExecutionContext;
 use crate::host_calls::execute_probe;
 use crate::model::{append_recent, Credential, PelicanResult, PELICAN_MAX_HTML};
-use gateway_plugin_sdk::client::HostClient;
 
 pub const PELICAN_PROMPT: &str =
     "不使用任何工具，也不要创建或修改文件，直接在回复中完成以下任务：\n\n\
@@ -12,7 +12,7 @@ pub const PELICAN_PROMPT: &str =
 在一个 ```html 代码块中给出完整的 HTML 文件。";
 
 pub async fn evaluate(
-    host: &HostClient,
+    host: &impl ExecutionContext,
     credential: &Credential,
     model: &str,
     effort: &str,

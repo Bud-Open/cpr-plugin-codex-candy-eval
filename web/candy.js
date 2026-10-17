@@ -43,7 +43,7 @@ function renderCandyRow(a) {
   const progress = a.running && `${a.running.done}/${a.running.total}`;
   const blocker = runBlocker("", a);
   const button = progress
-    ? `<button class="btn ghost" type="button" aria-label="测试中 ${progress}" data-tip disabled>${icon("loader-circle", "spin")}<span class="mono">${progress}</span></button>`
+    ? `<button class="btn ghost" type="button" data-candy-cancel="${esc(a.id)}" data-tip="停止测试，已完成 ${progress}">${icon("square")}停止<span class="mono">${progress}</span></button>`
     : `<button class="btn" type="button" data-candy-run="${esc(a.id)}" ${disabledFor(blocker)}>${icon("play")}测试</button>`;
 
   return credentialRow({
@@ -96,6 +96,8 @@ function initializeCandy() {
     }
     const btn = e.target.closest("[data-candy-run]");
     if (btn) return runCandy({ auth_ids: [btn.dataset.candyRun] });
+    const cancel = e.target.closest("[data-candy-cancel]");
+    if (cancel) return update("/cancel", { method: "POST", body: { id: cancel.dataset.candyCancel } }, "停止测试失败");
     const row = e.target.closest("[data-row]");
     if (!row) return;
     const id = row.dataset.row;

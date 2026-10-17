@@ -71,7 +71,7 @@ document.addEventListener("keydown", (event) => {
   for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
 });
 
-// 状态、停止等短调用设本地时限；评测由宿主保留作用域，不以页面 60 秒计时器中止等待。
+// 管理调用只提交或查询插件后台任务；页面请求设 60 秒时限，不限制后台评测生命周期。
 const REQUEST_TIMEOUT_MS = 60000;
 
 function withDeadline(promise, ms = REQUEST_TIMEOUT_MS) {
@@ -90,9 +90,9 @@ async function api(path, { method = "GET", body, apiKey, signal } = {}) {
   if (signal?.aborted) throw signal.reason;
   const [routePath, query = ""] = path.split("?", 2);
   const route = bridgeRoute(routePath);
-  const background = method === "POST" && /^api\/(?:run|(?:modeltrace|pelican|fingerprint)\/run|inspection)$/.test(route);
+  const background = method === "POST" && /^api\/(?:run|(?:modeltrace|pelican|fingerprint)\/run)$/.test(route);
   const parameters = new URLSearchParams(query);
-  if (background) parameters.set("__cpr_background", "1");
+  if (background) parameters.set("background", "1");
   let payload, contentType;
   if (body !== undefined) {
     contentType = "application/json";
@@ -101,7 +101,7 @@ async function api(path, { method = "GET", body, apiKey, signal } = {}) {
   let result;
   try {
     const request = bridge.request({ method, path: route, query: parameters.toString(), contentType, body: payload });
-    result = await (background ? request : withDeadline(request));
+    result = await withDeadline(request);
   } catch (err) {
     if (signal?.aborted) throw signal.reason;
     throw new Error(String(err?.message || err).slice(0, 500));
@@ -285,13 +285,13 @@ async function load({ refresh = false, quiet = false } = {}) {
   }
 }
 
-// CPR 的 /run 在当前管理调用作用域内执行完毕才返回；started 是执行过的凭证数，
-// 不是异步任务的启动确认。其余字段是账号 ID 数组，不能按 truthiness 判断或直接拼接。
+// queued=true 表示后台任务已接收；无 queued 的旧同步调用仍表示执行完毕。
+// 账号列表字段按数量处理，空数组不生成跳过警告。
 function runResponseNotice(response) {
   const count = (value) => Array.isArray(value) ? value.length : Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const started = count(response?.started), skipped = count(response?.skipped);
   const unchecked = count(response?.unchecked), busy = count(response?.busy);
-  const messages = [started ? `本轮测试已结束：${started} 个凭证，结果见历史记录` : "本轮未执行新的测试"];
+  const messages = [started ? (response?.queued ? `已开始后台测试：${started} 个凭证，切换页面不影响执行` : `本轮测试已结束：${started} 个凭证，结果见历史记录`) : "本轮未执行新的测试"];
   if (skipped) messages.push(`${skipped} 个凭证不可用或已停用，已跳过`);
   if (unchecked) messages.push(`${unchecked} 个凭证未确认支持所选模型，已跳过`);
   if (busy) messages.push(`${busy} 个凭证已有任务，已跳过`);
@@ -305,7 +305,7 @@ async function update(path, options, errorPrefix) {
   stopPolling();
   setNotice("flash", isRun ? "正在准备测试请求…" : "", "info");
   render();
-  // 采集在插件内同步执行，期间必须继续拉状态，否则按钮一直停在“测试”看不出已开始。
+  // 等待启动确认期间继续读取状态；接收成功后恢复正常后台进度轮询。
   const watch = watchWhilePending();
   try {
     if (isRun) {
@@ -314,7 +314,7 @@ async function update(path, options, errorPrefix) {
       setNotice("catalog-error", "");
       if (!catalogCache.models?.ids.includes(options.body.model)) throw new Error("所选模型已不在模型列表中，请重新选择。");
       options.body.model_catalog = await modelCatalog(options.body.auth_ids || []);
-      setNotice("flash", "测试请求已提交，等待执行结果；进度请查看列表。", "info");
+      setNotice("flash", "测试请求已提交，等待启动确认；进度请查看列表。", "info");
     }
     const response = await api(BASE + path, options);
     if (isRun) {
@@ -455,7 +455,7 @@ function bindCollectionActions({ type, scope, expanded, renderRows, run, showDet
     const runID = action("run");
     if (runID) return run({ auth_ids: [runID] });
     const cancelID = action("cancel");
-    if (cancelID) return update(`/${scope}/cancel`, { method: "POST", body: { auth_ids: [cancelID] } }, "停止测试失败");
+    if (cancelID) return update(`/${scope}/cancel`, { method: "POST", body: { id: cancelID } }, "停止测试失败");
     const recordID = action("detail"), credentialID = action("credential");
     if (recordID && credentialID) return openResultDetail(type, scope, credentialID, recordID, showDetail);
     const toggleID = e.target.closest("[data-row]")?.dataset.row;

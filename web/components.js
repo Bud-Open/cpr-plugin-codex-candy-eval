@@ -147,7 +147,7 @@ function collectionOutcome(p, total, showModel = false) {
   });
 }
 function collectionButton(type, credential, progress, label) {
-  if (progress) return `<button class="btn ghost" type="button" data-${type}-cancel="${esc(credential.id)}" data-tip="停止发送新请求，已发出的请求会继续完成" ${pending || progress.phase === "cancelling" ? "disabled" : ""}>停止</button>`;
+  if (progress) return `<button class="btn ghost" type="button" data-${type}-cancel="${esc(credential.id)}" data-tip="停止测试，保留已完成结果" ${pending || progress.phase === "cancelling" ? "disabled" : ""}>停止</button>`;
   return `<button class="btn" type="button" data-${type}-run="${esc(credential.id)}" ${disabledFor(runBlocker(type + "-", credential))}>${icon("play")}${esc(label)}</button>`;
 }
 // The latest result of a single-prompt test: its verdict and model, then its usage.

@@ -54,7 +54,7 @@ function pelicanHistory(a, r) {
 function renderPelicanRow(a) {
   const history = a.pelicans || [], last = history.at(-1);
   const button = a.pelican_running
-    ? `<button class="btn ghost" type="button" data-tip="正在等待模型生成动画" disabled>${icon("loader-circle", "spin")}测试中</button>`
+    ? `<button class="btn ghost" type="button" data-pl-cancel="${esc(a.id)}" data-tip="停止后台测试">${icon("square")}停止</button>`
     : collectionButton("pl", a, null, "测试");
   return credentialRow({
     type: "pl", credential: a, selected: plSelected.has(a.id), open: plExpanded.has(a.id), selectable: runnable("pl-", a), button,

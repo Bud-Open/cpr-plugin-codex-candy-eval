@@ -1,4 +1,4 @@
-use codex_proxy_plugin_candy_eval::{manifest, plugin, PLUGIN_ID};
+use codex_proxy_plugin_candy_eval::{manifest, plugin_with_config, PLUGIN_ID};
 use gateway_plugin_sdk::client::{PluginSession, SessionConfig, SessionError};
 
 #[tokio::main(flavor = "current_thread")]
@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err(SessionError::Handshake.into());
     }
-    session.run(plugin()?).await?;
+    let plugin = plugin_with_config(session.handshake().configuration.clone())?;
+    session.run(plugin).await?;
     Ok(())
 }
