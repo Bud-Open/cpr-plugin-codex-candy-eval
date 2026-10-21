@@ -145,6 +145,7 @@ let mockAnswers = [true, false, true];
 let mockRunResponse = { started: 1, skipped: [], unchecked: [], busy: [] };
 let mockRunGate = null, mockRunStatus = 200;
 let mockRunning = {};
+let mockHourly = { enabled: true, interval_seconds: 3600, model: "gpt-6.1-sol", effort: "low", next_run_at: new Date(Date.now() + 3600000).toISOString() };
 
 function mockBackend(call) {
   // 真实插件状态里失败记录的字段集：没有 attribution，samples 为空数组。
@@ -180,7 +181,7 @@ function mockBackend(call) {
       effort: "low", ok, answer: ok ? "21" : "22", error: "", input_tokens: 10,
       output_tokens: 5, reasoning_tokens: 0, duration_ms: 1200,
     }));
-    return { status: 200, body: { auths: [{ ...credential, results, ...mockRunning }], models: ["gpt-6.1-sol"], storage_error: "", version: "1.0.0" } };
+    return { status: 200, body: { auths: [{ ...credential, results, ...mockRunning }], models: ["gpt-6.1-sol"], hourly_candy: mockHourly, storage_error: "", version: "1.0.0" } };
   }
   const handler = routes[`${call.method} ${call.path}`];
   if (!handler) return { status: 404, body: { error: { message: `未注册路由：${call.method} ${call.path}` } } };
@@ -285,6 +286,7 @@ const $ = (id) => doc.getElementById(id);
 for (const error of errors) fail(`页面抛出异常：${error}`);
 check($("app") && !$("app").hidden, "主界面未显示");
 check($("login") && $("login").hidden, "不应要求管理密钥登录");
+check(!$("hourly-candy").hidden && $("hourly-candy").textContent.includes("每小时自动测试") && $("hourly-candy").textContent.includes("下次"), "自动糖果状态必须显示启用配置与下次调度时间");
 check(doc.documentElement.dataset.cprPluginHost === "", "未标记 CPR 宿主，主题样式不会生效");
 check(['0', '0px'].includes(dom.window.getComputedStyle(doc.querySelector('main')).minHeight), "CPR 自动高度页面不得保留视口最小高度");
 
@@ -418,6 +420,12 @@ await dom.window.eval('runCandy({ all: true })');
 check($("flash").dataset.tone === "error" && flash().includes("模拟执行请求失败"), "请求失败必须保留真实错误提示");
 check(!flash().includes("已结束"), "失败请求不能生成完成提示");
 mockRunStatus = 200;
+mockHourly = { ...mockHourly, last_dispatch: { status: "dispatch_error" } };
+await dom.window.eval('load()');
+check($("hourly-candy").textContent.includes("上次调度失败"), "自动调度失败不能显示为正常完成");
+mockHourly = { enabled: false };
+await dom.window.eval('load()');
+check($("hourly-candy").textContent.includes("未启用"), "关闭自动测试后必须显示停用状态");
 for (const call of calls) {
   const route = `${call.method} ${call.path}`;
   check(registered.has(route), `未注册的运行/轮询路由：${route}`);

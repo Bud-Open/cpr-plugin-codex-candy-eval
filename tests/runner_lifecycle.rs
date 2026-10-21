@@ -55,7 +55,7 @@ impl Fixture {
             .send(
                 Message::Hello {
                     handshake: Handshake {
-                        protocol_version: 2,
+                        protocol_version: gateway_plugin_sdk::PROTOCOL_VERSION,
                         artifact_sha256: "fixture-artifact".into(),
                         plugin_id: "nmbb.codex-candy-eval".into(),
                         instance_id: "fixture-instance".into(),
@@ -111,6 +111,7 @@ impl Fixture {
     ) {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
         let context = CallContext {
+            request: None,
             call_id: id,
             instance_id: "fixture-instance".into(),
             generation: 1,
@@ -319,6 +320,7 @@ impl Fixture {
                 id,
                 method: "plugin.reconcile".into(),
                 context: CallContext {
+                    request: None,
                     call_id: id,
                     instance_id: "fixture-instance".into(),
                     generation: 1,
@@ -521,4 +523,83 @@ async fn all_suite_background_jobs_can_be_stopped_and_restarted_without_sdk_mode
         assert_eq!(restarted.1["started"], 1, "suite={path}");
         assert_eq!(fixture.executions, 0);
     }
+}
+
+#[tokio::test]
+async fn hourly_candy_runs_without_a_page_and_does_not_replay_after_restart() {
+    let server = LocalModel::new().await;
+    let config = json!({"api_base_url":server.base,"hourly_candy_enabled":true});
+    let mut fixture = Fixture::configured(config.clone()).await;
+    fixture.maintenance(1).await;
+    server.wait_started(1).await;
+    fixture.call(3, "api/state", None, false, 5000).await;
+    let state = fixture.reply(3).await.1;
+    assert_eq!(state["hourly_candy"]["enabled"], true);
+    assert_eq!(state["hourly_candy"]["interval_seconds"], 3600);
+    assert_eq!(state["hourly_candy"]["last_dispatch"]["started"], 1);
+    let last = state["hourly_candy"]["last_started_at"].clone();
+    let next = state["hourly_candy"]["next_run_at"].clone();
+    assert_ne!(last, next);
+    fixture.maintenance(5).await;
+    assert_eq!(server.request_count(), 1);
+    server.release.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    fixture.maintenance(7).await;
+    let saved = fixture.states.clone();
+    assert_eq!(
+        fixture.running(9).await["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(fixture.executions, 0);
+    drop(fixture);
+    let mut reloaded = Fixture::configured(config).await;
+    reloaded.states = saved;
+    reloaded.maintenance(1).await;
+    reloaded.call(3, "api/state", None, false, 5000).await;
+    let state = reloaded.reply(3).await.1;
+    assert_eq!(state["hourly_candy"]["last_started_at"], last);
+    assert_eq!(state["hourly_candy"]["next_run_at"], next);
+    assert!(state["auths"][0]["running"].is_null());
+    assert_eq!(state["auths"][0]["results"].as_array().unwrap().len(), 1);
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn hourly_candy_skips_an_account_owned_by_a_manual_run() {
+    let server = LocalModel::new().await;
+    let mut fixture =
+        Fixture::configured(json!({"api_base_url":server.base,"hourly_candy_enabled":true})).await;
+    fixture
+        .call(
+            1,
+            "api/run",
+            Some(json!({"model":"gpt-6.1-sol","all":true,"runs":1})),
+            true,
+            5000,
+        )
+        .await;
+    assert_eq!(fixture.reply(1).await.0, 202);
+    server.wait_started(1).await;
+    fixture.maintenance(3).await;
+    fixture.call(5, "api/state", None, false, 5000).await;
+    let state = fixture.reply(5).await.1;
+    assert_eq!(state["hourly_candy"]["last_dispatch"]["started"], 0);
+    assert_eq!(state["hourly_candy"]["last_dispatch"]["busy"], 1);
+    assert_eq!(server.request_count(), 1);
+    server.release.add_permits(1);
+}
+
+#[tokio::test]
+async fn maintenance_with_hourly_disabled_never_submits_a_model_request() {
+    let server = LocalModel::new().await;
+    let mut fixture = Fixture::configured(json!({"api_base_url":server.base})).await;
+    fixture.maintenance(1).await;
+    fixture.call(3, "api/state", None, false, 5000).await;
+    let state = fixture.reply(3).await.1;
+    assert_eq!(state["hourly_candy"]["enabled"], false);
+    assert!(state["hourly_candy"]["last_started_at"].is_null());
+    assert_eq!(server.request_count(), 0);
 }

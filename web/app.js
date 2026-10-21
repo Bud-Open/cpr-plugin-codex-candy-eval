@@ -18,6 +18,7 @@ let loadController = null;
 let refreshing = false;
 let pending = false;
 let storageError = "";
+let hourlyCandy = null;
 let clearScope = "candy";
 // Enable changes in flight, by credential ID; reloads keep these requested states.
 const switching = new Map();
@@ -213,6 +214,7 @@ function render() {
   renderPageActions();
   setNotice("storage-error", storageError);
   renderCredentialFilters();
+  renderHourlyCandy();
   renderCandy();
   renderFingerprints();
   renderModelTrace();
@@ -256,6 +258,7 @@ async function load({ refresh = false, quiet = false } = {}) {
     for (const a of credentials) if (switching.has(a.id)) a.disabled = switching.get(a.id);
     pruneCredentialCatalog();
     storageError = data.storage_error || "";
+    hourlyCandy = data.hourly_candy || null;
     loadError = "";
     setNotice("load-error", "");
     const ids = new Set(credentials.map((a) => a.id));
@@ -347,6 +350,7 @@ function showLogin(message) {
   resetCatalogCache();
   credentials = [];
   loadError = storageError = "";
+  hourlyCandy = null;
   for (const collection of [candySelected, fpSelected, mtSelected, plSelected, candyExpanded, fpExpanded, mtExpanded, plExpanded, candyAnswersExpanded, pelicanPages]) collection.clear();
   for (const id of notices.keys()) setNotice(id, "");
   hideTip();

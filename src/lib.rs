@@ -11,6 +11,7 @@ pub mod command;
 pub mod execution;
 pub mod fingerprint;
 pub mod host_calls;
+mod hourly;
 pub mod management;
 pub mod manifest;
 pub mod model;

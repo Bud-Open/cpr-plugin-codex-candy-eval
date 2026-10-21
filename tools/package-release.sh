@@ -37,7 +37,7 @@ package=folder/f'nmbb.codex-candy-eval-{version}-x86_64-unknown-linux-gnu.tar.gz
 with tarfile.open(package) as archive:
     manifest=json.load(archive.extractfile('plugin.json'))
     assert manifest['version']==version
-    assert manifest['package']['protocolVersion']==2
+    assert manifest['package']['protocolVersion']==5
     assert set(archive.getnames())=={'plugin.json',*manifest['package']['files']}
     assert not any(name.endswith('.js') for name in manifest['resources'])
     for name,digest in manifest['package']['files'].items():

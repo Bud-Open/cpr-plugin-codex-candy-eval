@@ -1,5 +1,16 @@
 "use strict";
 
+function renderHourlyCandy() {
+  const node = $("hourly-candy");
+  node.hidden = !hourlyCandy;
+  if (!hourlyCandy) return;
+  if (!hourlyCandy.enabled) { node.textContent = "每小时自动测试：未启用（可在插件设置中开启）"; return; }
+  const next = hourlyCandy.next_run_at ? new Date(hourlyCandy.next_run_at) : null;
+  const due = next && next > new Date() ? `下次 ${next.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "等待调度";
+  const error = hourlyCandy.last_dispatch?.status;
+  const warning = ["dispatch_error", "storage_error", "credentials_error"].includes(error) ? " · 上次调度失败，请检查服务状态" : "";
+  node.textContent = `每小时自动测试 · ${hourlyCandy.model} / ${hourlyCandy.effort} · 每账号 1 次 · ${due}${warning}`;
+}
 const candyExpanded = new Set();
 const candyAnswersExpanded = new Set();
 const candySelected = new Set();

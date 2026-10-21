@@ -39,6 +39,8 @@ struct Inner {
     cancelled: BTreeSet<String>,
     /// 最近一次巡检结果。
     inspection: serde_json::Value,
+    hourly_candy_at: i64,
+    hourly_dispatch: serde_json::Value,
     /// 读取到损坏状态时暂停保存，避免覆盖用户原文件。
     load_error: Option<String>,
     storage_error: String,
@@ -183,6 +185,7 @@ impl StateManager {
                 inner.pelicans = state.pelicans;
                 inner.fingerprints = state.fingerprints;
                 inner.traces = state.traces;
+                inner.hourly_candy_at = state.hourly_candy_at;
                 for history in inner.results.values_mut() {
                     trim(history);
                 }
@@ -233,6 +236,7 @@ impl StateManager {
             pelicans: inner.pelicans.clone(),
             fingerprints: inner.fingerprints.clone(),
             traces: inner.traces.clone(),
+            hourly_candy_at: inner.hourly_candy_at.max(incoming.hourly_candy_at),
         };
         merge_histories(&mut merged.results, incoming.results)?;
         merge_histories(&mut merged.pelicans, incoming.pelicans)?;
@@ -250,6 +254,7 @@ impl StateManager {
         inner.pelicans = merged.pelicans;
         inner.fingerprints = merged.fingerprints;
         inner.traces = merged.traces;
+        inner.hourly_candy_at = merged.hourly_candy_at;
         inner.version = Some(version);
         inner.storage_error.clear();
         Ok(report)
@@ -442,6 +447,36 @@ impl StateManager {
         self.inner.read().await.inspection.clone()
     }
 
+    /// Claim once, before making model requests. Failed saves prohibit dispatch.
+    pub async fn claim_hourly_candy(&self, now: i64) -> Option<u64> {
+        let mut inner = self.inner.write().await;
+        if !inner.loaded
+            || inner.load_error.is_some()
+            || !inner.storage_error.is_empty()
+            || now <= 0
+            || !crate::hourly::due(inner.hourly_candy_at, now)
+        {
+            return None;
+        }
+        inner.hourly_candy_at = now;
+        inner.hourly_dispatch = serde_json::json!({"status":"starting"});
+        inner.revision += 1;
+        Some(inner.revision)
+    }
+
+    pub async fn revision_committed(&self, revision: u64) -> bool {
+        self.inner.read().await.committed_revision >= revision
+    }
+
+    pub async fn hourly_candy(&self) -> (i64, serde_json::Value) {
+        let inner = self.inner.read().await;
+        (inner.hourly_candy_at, inner.hourly_dispatch.clone())
+    }
+
+    pub async fn set_hourly_dispatch(&self, value: serde_json::Value) {
+        self.inner.write().await.hourly_dispatch = value;
+    }
+
     /// 某凭证是否已有测试在进行中。
     pub async fn busy(&self, id: &str) -> bool {
         let inner = self.inner.read().await;
@@ -568,6 +603,7 @@ impl StateManager {
                 pelicans: inner.pelicans.clone(),
                 fingerprints: inner.fingerprints.clone(),
                 traces: inner.traces.clone(),
+                hourly_candy_at: inner.hourly_candy_at,
             };
             let mut value = serde_json::to_value(&state).unwrap_or_default();
             // 超限时反复丢弃最长的历史中最早的一条记录，直到落在配额内。

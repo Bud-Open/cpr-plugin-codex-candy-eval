@@ -67,6 +67,7 @@ impl Host {
         let id = self.next_call;
         self.next_call += 2; // Native host calls are odd; plugin callbacks are even.
         let context = CallContext {
+            request: None,
             call_id: id,
             instance_id: "test-instance".into(),
             generation: 1,
@@ -177,9 +178,23 @@ async fn large_recovery_is_idempotent_and_survives_a_new_process() {
         method: "host.state.put".into(),
         params: json!({"namespace":"candy-eval","key":"global","value":value,"expected_version":1}),
     });
+    // RPC v4 keeps the 64KiB metadata limit but moves business JSON into a data section.
+    let mut wire = Vec::new();
+    write_frame(&mut wire, &old).await.unwrap();
+    let metadata_bytes = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+    let payload_bytes = u64::from_be_bytes(wire[4..12].try_into().unwrap());
+    assert!(metadata_bytes <= 64 * 1024);
     assert!(
-        gateway_plugin_sdk::client::validate_frame(&old).is_err(),
-        "reproduce the old failure"
+        payload_bytes > 64 * 1024,
+        "large state must use the v4 data section"
+    );
+    let decoded = read_frame(&mut wire.as_slice()).await.unwrap();
+    let Message::Callback { params, .. } = decoded.message else {
+        panic!("expected state callback")
+    };
+    assert_eq!(
+        params["value"], value,
+        "v4 must preserve the complete large state"
     );
     let mut host = Host::start(legacy()).await;
     let (status, report) = host.call("POST", "api/storage/recover", &value).await;

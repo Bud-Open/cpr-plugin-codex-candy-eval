@@ -194,7 +194,7 @@ pub async fn handle_with_config(
                 &json!({"synced": count, "message": "已读取 CPR 宿主账号，无需导入凭证"}),
             )
         }
-        ("GET", "api/state") => state_reply(state, host).await,
+        ("GET", "api/state") => state_reply(state, host, config).await,
         ("POST", "api/storage/recover") => {
             if call.payload.len() > crate::storage::MAXIMUM_SNAPSHOT_BYTES {
                 return json_reply(413, &json!({"error":"恢复快照超过容量，原历史未被覆盖"}));
@@ -360,6 +360,7 @@ async fn management_config(state: &StateManager, host: &HostClient) -> Result<Va
 async fn state_reply(
     state: &StateManager,
     host: &HostClient,
+    config: &Value,
 ) -> Result<TypedReply<ManagementResponse>, PluginFault> {
     refresh_credentials(state, host).await?;
     let (credentials, storage_error) = state.views().await;
@@ -370,6 +371,7 @@ async fn state_reply(
             "auths": credentials,
             "models": models,
             "storage_error": storage_error,
+            "hourly_candy": crate::hourly::status(state, config).await,
             "version": API_VERSION,
         }),
     )

@@ -383,6 +383,16 @@ fn append_event(sse: &mut Vec<u8>, event: &ExecutionEvent) -> Result<(), ModelEr
                 }
                 return Ok(());
             }
+            WirePayload::WebSocket { data, message, .. } => {
+                let data = match data {
+                    Some(data) => data.clone(),
+                    None => serde_json::from_slice(message).map_err(|_| {
+                        ModelError::other(ModelFailure::Host, "模型 WebSocket 消息不是有效 JSON")
+                    })?,
+                };
+                sse.extend_from_slice(format!("data: {data}\n\n").as_bytes());
+                return Ok(());
+            }
             WirePayload::RawJson { body } | WirePayload::RawBody { body } => {
                 sse.extend_from_slice(body);
                 if !body.ends_with(b"\n") {
@@ -655,7 +665,7 @@ pub fn valid_model_name(model: &str) -> bool {
         && !model.contains(['(', ')'])
 }
 
-/// 单次探测的读取上限：模型回答最长 10 分钟。
+/// 单次探测期限：模型回答最长 3 分钟。
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[cfg(test)]
@@ -668,6 +678,54 @@ mod tests {
             out.extend_from_slice(format!("data: {event}\n\n").as_bytes());
         }
         out
+    }
+
+    #[test]
+    fn decodes_rpc_v5_websocket_batches_with_or_without_json_view() {
+        use gateway_plugin_sdk::call::model::WireEvent;
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 5);
+        let response = serde_json::json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": "21"}
+            ]}], "usage": {"input_tokens": 10, "output_tokens": 4}}
+        });
+        for data in [None, Some(response.clone())] {
+            let encoded = ModelEventBatch {
+                events: vec![ExecutionEvent::wire(WireEvent {
+                    protocol: "openai".into(),
+                    payload: WirePayload::WebSocket {
+                        event: Some("response.completed".into()),
+                        data,
+                        message: serde_json::to_vec_pretty(&response).unwrap(),
+                    },
+                })],
+            }
+            .encode()
+            .unwrap();
+            let batch = ModelEventBatch::decode(&encoded).unwrap();
+            let mut buffer = Vec::new();
+            append_event(&mut buffer, &batch.events[0]).unwrap();
+            let answer = parse_response(&buffer, Instant::now()).unwrap();
+            assert_eq!(answer.text, "21");
+            assert_eq!(answer.input_tokens, 10);
+            assert_eq!(answer.output_tokens, 4);
+        }
+    }
+
+    #[test]
+    fn rejects_websocket_message_without_valid_json() {
+        use gateway_plugin_sdk::call::model::WireEvent;
+        let event = ExecutionEvent::wire(WireEvent {
+            protocol: "openai".into(),
+            payload: WirePayload::WebSocket {
+                event: None,
+                data: None,
+                message: b"not-json".to_vec(),
+            },
+        });
+        let error = append_event(&mut Vec::new(), &event).unwrap_err();
+        assert_eq!(error.kind, ModelFailure::Host);
     }
 
     #[test]

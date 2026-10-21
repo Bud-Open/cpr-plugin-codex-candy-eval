@@ -150,6 +150,9 @@ pub struct PersistedState {
     pub fingerprints: std::collections::BTreeMap<String, Vec<FingerprintResult>>,
     #[serde(default)]
     pub traces: std::collections::BTreeMap<String, Vec<TraceResult>>,
+    /// Persisted dispatch watermark: restarts never replay the previous hourly slot.
+    #[serde(default)]
+    pub hourly_candy_at: i64,
 }
 
 /// 把新记录追加到历史尾部并裁剪到上限。

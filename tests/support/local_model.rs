@@ -82,6 +82,9 @@ impl LocalModel {
             task,
         }
     }
+    pub fn request_count(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
     pub async fn wait_started(&self, expected: usize) {
         timeout(Duration::from_secs(5), async {
             while self.started.load(Ordering::SeqCst) < expected {
