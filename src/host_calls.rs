@@ -681,9 +681,9 @@ mod tests {
     }
 
     #[test]
-    fn decodes_rpc_v5_websocket_batches_with_or_without_json_view() {
+    fn decodes_websocket_batches_with_or_without_json_view() {
         use gateway_plugin_sdk::call::model::WireEvent;
-        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 5);
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 6);
         let response = serde_json::json!({
             "type": "response.completed",
             "response": {"status": "completed", "output": [{"type": "message", "content": [

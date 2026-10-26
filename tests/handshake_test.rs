@@ -43,6 +43,7 @@ async fn test_plugin_hello_handshake() {
         Message::Ready {
             protocol_version,
             incarnation,
+            ..
         } => {
             assert_eq!(protocol_version, PROTOCOL_VERSION);
             assert_eq!(incarnation, "test_incarnation");
