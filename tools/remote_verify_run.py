@@ -4,7 +4,7 @@
 Triggers one real test through the official CPR plugin management route and
 reports an aggregate-only result: statuses, counts, timings and token totals.
 Account identifiers, credentials, admin keys and model output text are never
-printed; error strings pass through a category-level redaction first.
+printed; error strings are replaced with a fixed presence marker.
 
 Usage: python3 remote-verify-run.py [candy|fingerprint|modeltrace|pelican] [model] [effort]
 """
@@ -31,22 +31,30 @@ SUITES = {
     'pelican': ('api/pelican/run', 'pelicans', {}),
 }
 
-EMAIL = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
-UUID = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b')
-TOKEN = re.compile(r'\b[A-Za-z0-9_\-]{20,}\b')
-IPV4 = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b')
-IPV6 = re.compile(r'\b(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F]{0,4}\b')
-URL = re.compile(r'https?://\S+')
+NUMBER_FIELDS = {
+    'input_tokens', 'output_tokens', 'reasoning_tokens', 'duration_ms',
+    'total', 'done', 'valid', 'errors', 'concurrency', 'attempts', 'used_outputs',
+}
+FLAG_FIELDS = {'ok', 'skipped'}
+STRING_FIELDS = {'id', 'time', 'model', 'effort', 'answer', 'html', 'text', 'error', 'status', 'mode', 'bank_revision'}
+SUMMARY_FIELDS = NUMBER_FIELDS | FLAG_FIELDS | STRING_FIELDS | {'samples', 'attribution', 'analysis'}
 
 
 def redact(text):
-    """Category-level detail only; never echo raw upstream or identity text."""
-    if not text:
-        return ''
-    for pattern, label in ((EMAIL, 'email'), (UUID, 'uuid'), (URL, 'url'),
-                           (IPV4, 'ipv4'), (IPV6, 'ipv6'), (TOKEN, 'token')):
-        text = pattern.sub('<redacted-{0}>'.format(label), text)
-    return text[:240]
+    """错误原文可能包含任意短凭据，只返回固定的存在标记"""
+    return 'error_present' if text else ''
+
+
+def submission_summary(reply):
+    """提交响应仅保留数量与布尔值，账号数组不进入输出"""
+    reply = reply if isinstance(reply, dict) else {}
+    started = reply.get('started')
+    return {
+        'started': started if type(started) is int and started >= 0 else 0,
+        'queued': reply.get('queued') is True,
+        **{key + '_count': len(reply[key]) if isinstance(reply.get(key), list) else 0
+           for key in ('busy', 'skipped', 'unchecked')},
+    }
 
 
 def pg_command(tool, arguments, **options):
@@ -127,10 +135,10 @@ def newest(entry, key):
 
 def summarise(record):
     """Schema-level summary: field names and magnitudes, never payload text."""
-    error = str(record.get('error', ''))
-    if record.get('skipped'):
+    error = record.get('error', '')
+    if record.get('skipped') is True:
         status = 'skipped'
-    elif record.get('ok'):
+    elif record.get('ok') is True:
         status = 'ok'
     elif error:
         status = 'error'
@@ -138,9 +146,11 @@ def summarise(record):
         status = 'unknown'
     return {
         'status': status,
-        'numbers': {k: v for k, v in sorted(record.items()) if isinstance(v, int)},
-        'string_chars': {k: len(v) for k, v in sorted(record.items()) if isinstance(v, str)},
-        'keys': sorted(record),
+        'numbers': {k: v for k, v in sorted(record.items())
+                    if (k in NUMBER_FIELDS and type(v) is int) or (k in FLAG_FIELDS and isinstance(v, bool))},
+        'string_chars': {k: len(v) for k, v in sorted(record.items()) if k in STRING_FIELDS and isinstance(v, str)},
+        'keys': sorted(record.keys() & SUMMARY_FIELDS),
+        'unknown_fields': len(record.keys() - SUMMARY_FIELDS),
         'error': redact(error),
     }
 
@@ -164,8 +174,8 @@ def main():
 
     payload = {'model': model, 'effort': effort, 'all': True, **extra}
     started = management(instance, route, 'POST', payload)
-    print(json.dumps({'phase': 'submitted', 'suite': suite, 'started': started,
-                      'accounts': len(before)}), flush=True)
+    print(json.dumps({'phase': 'submitted', 'suite': suite, 'accounts': len(before),
+                      **submission_summary(started)}), flush=True)
 
     deadline = time.monotonic() + POLL_LIMIT_SECONDS
     attempts = 0
@@ -191,5 +201,5 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:  # Aggregate failure category only.
-        print(json.dumps({'phase': 'failed', 'error': type(error).__name__, 'detail': redact(str(error))}))
+        print(json.dumps({'phase': 'failed', 'error': type(error).__name__, 'detail': redact(error)}))
         raise SystemExit(1)

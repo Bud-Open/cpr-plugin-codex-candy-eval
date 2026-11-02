@@ -72,6 +72,19 @@ async fn accounts_roundtrip(mode: ResponseMode) -> Frame {
     loop {
         let frame = read_frame(&mut output).await.unwrap();
         match &frame.message {
+            Message::Suspend { .. } | Message::CallbackConsumed { .. } => continue,
+            Message::Resume { id, epoch } => {
+                write_frame(
+                    &mut input,
+                    &Frame::control(Message::Resumed {
+                        id: *id,
+                        epoch: *epoch,
+                    }),
+                )
+                .await
+                .unwrap();
+                continue;
+            }
             Message::Callback {
                 id, method, params, ..
             } if method == ACCOUNTS_LIST => {

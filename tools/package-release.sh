@@ -2,6 +2,8 @@
 # Build and package through CPR's official CLI; never overwrite an existing release.
 set -euo pipefail
 umask 077
+# 从工程外调用脚本时同样选用 SDK 所需工具链，显式环境覆盖仍由调用方决定。
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.99.1}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cargo="${CARGO:-${HOME}/.cargo/bin/cargo}"
 cli="${CPR_PLUGIN_CLI:-${HOME}/.cargo/bin/cpr-plugin}"
@@ -19,6 +21,7 @@ output="$root/dist/native-$version"
 [[ ! -e "$output" ]] || { printf '%s\n' 'Release output already exists; refusing to overwrite.' >&2; exit 1; }
 "$cargo" fmt --manifest-path "$root/Cargo.toml" -- --check
 "$cargo" test --offline --locked --manifest-path "$root/Cargo.toml"
+python3 -m unittest discover -s "$root/tests" -p 'test_*.py'
 node "$root/tests/check-page.mjs" "$root"
 node "$root/tools/build-page.mjs" "$root"
 "$cargo" build --offline --locked --release --manifest-path "$root/Cargo.toml"
@@ -37,7 +40,7 @@ package=folder/f'nmbb.codex-candy-eval-{version}-x86_64-unknown-linux-gnu.tar.gz
 with tarfile.open(package) as archive:
     manifest=json.load(archive.extractfile('plugin.json'))
     assert manifest['version']==version
-    assert manifest['package']['protocolVersion']==6
+    assert manifest['package']['protocolVersion']==7
     assert set(archive.getnames())=={'plugin.json',*manifest['package']['files']}
     assert not any(name.endswith('.js') for name in manifest['resources'])
     for name,digest in manifest['package']['files'].items():

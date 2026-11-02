@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "codex-proxy-plugin-candy-eval"
-version = "1.7.0"
+version = "1.11.0"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -289,7 +289,7 @@ dependencies = [
 [[package]]
 name = "gateway-plugin-sdk"
 version = "0.1.0"
-source = "git+https://github.com/zyycn/codex-proxy-rs.git?tag=v3.32.0#6a5300a7b5c649f2a6d548df70ccdd58d15e0025"
+source = "git+https://github.com/zyycn/codex-proxy-rs.git?tag=v3.38.1#e0b7a841ca074f17e11dad73f39a159c75cb2fb1"
 dependencies = [
  "base64 0.23.1",
  "semver",

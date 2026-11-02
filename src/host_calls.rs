@@ -202,9 +202,30 @@ impl std::fmt::Display for ModelError {
 
 impl ModelError {
     fn host(error: PluginFault) -> Self {
+        // 只保留本地固定文案和类型化错误类别，不把宿主原文带入历史或页面
+        let message = match error.message.as_str() {
+            "读取 CPR 执行 Key 目录失败" => "读取 CPR 执行 Key 目录失败",
+            "CPR 中没有启用的 API Key，无法建立模型测试执行身份" => {
+                "CPR 中没有启用的 API Key，无法建立模型测试执行身份"
+            }
+            _ => match error.code {
+                ErrorCode::Timeout => "模型请求超时",
+                ErrorCode::Cancelled => "模型请求已取消",
+                ErrorCode::PermissionDenied | ErrorCode::Rejected => {
+                    "模型请求被拒绝，请检查执行权限与账号状态"
+                }
+                ErrorCode::InvalidInput => "模型请求参数无效，请检查账号、Key 与模型配置",
+                ErrorCode::Capacity => "模型请求达到容量上限",
+                ErrorCode::Conflict => "模型请求配置已变更，请重试",
+                ErrorCode::Unsupported => "当前模型请求不受支持",
+                ErrorCode::Upstream => "模型上游请求失败",
+                ErrorCode::Uncertain => "模型请求结果不确定",
+                ErrorCode::Fault => "模型请求失败",
+            },
+        };
         Self {
             kind: ModelFailure::Host,
-            message: format!("模型请求失败：{}", error.message),
+            message: message.to_owned(),
         }
     }
 
@@ -494,7 +515,7 @@ pub(crate) fn parse_response(sse: &[u8], started: Instant) -> Result<ModelAnswer
             "error" => {
                 return Err(ModelError::other(
                     ModelFailure::Incomplete,
-                    format!("模型返回错误：{}", truncate(data, 300)),
+                    "模型返回错误事件",
                 ));
             }
             _ => {}
@@ -514,21 +535,22 @@ pub(crate) fn parse_response(sse: &[u8], started: Instant) -> Result<ModelAnswer
     }
 
     if !body.status.is_empty() && body.status != "completed" {
-        let detail = body
-            .error
-            .as_ref()
-            .filter(|value| !value.is_null())
-            .map(|value| truncate(&value.to_string(), 300))
-            .unwrap_or_default();
+        // status 同样来自上游，只允许已知状态，未知内容不透传
+        let status = match body.status.as_str() {
+            "failed" | "incomplete" | "cancelled" | "in_progress" | "queued" => {
+                body.status.as_str()
+            }
+            _ => "unknown",
+        };
         return Err(ModelError::other(
             ModelFailure::Incomplete,
-            format!("模型响应未完成（{}）：{}", body.status, detail),
+            format!("模型响应未完成（{status}）"),
         ));
     }
-    if let Some(error) = body.error.as_ref().filter(|value| !value.is_null()) {
+    if body.error.as_ref().is_some_and(|error| !error.is_null()) {
         return Err(ModelError::other(
             ModelFailure::Incomplete,
-            format!("模型响应未完成：{}", truncate(&error.to_string(), 300)),
+            "模型响应包含错误",
         ));
     }
 
@@ -683,7 +705,7 @@ mod tests {
     #[test]
     fn decodes_websocket_batches_with_or_without_json_view() {
         use gateway_plugin_sdk::call::model::WireEvent;
-        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 6);
+        assert_eq!(gateway_plugin_sdk::PROTOCOL_VERSION, 7);
         let response = serde_json::json!({
             "type": "response.completed",
             "response": {"status": "completed", "output": [{"type": "message", "content": [
@@ -750,12 +772,68 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_status() {
-        let raw = sse(&[
-            r#"{"type":"response.incomplete","response":{"status":"incomplete","error":{"message":"x"},"output":[]}}"#,
-        ]);
-        let error = parse_response(&raw, Instant::now()).expect_err("未完成应判定失败");
-        assert_eq!(error.kind, ModelFailure::Incomplete);
+    fn rejects_incomplete_status_without_echoing_untrusted_fields() {
+        let marker = "upstream-private-fixture";
+        for status in ["incomplete", "failed", "cancelled", marker] {
+            let event = serde_json::json!({"type":"response.incomplete","response":{
+                "status":status,"error":{"message":marker,"token":marker},"output":[]
+            }})
+            .to_string();
+            let error =
+                parse_response(&sse(&[&event]), Instant::now()).expect_err("未完成应判定失败");
+            assert_eq!(error.kind, ModelFailure::Incomplete);
+            let safe_status = if status == marker { "unknown" } else { status };
+            assert_eq!(error.message, format!("模型响应未完成（{safe_status}）"));
+        }
+    }
+
+    #[test]
+    fn error_events_and_terminal_errors_never_echo_upstream_payloads() {
+        let marker = "upstream-private-fixture";
+        let detail = serde_json::json!({"message":marker,"token":marker,
+            "headers":{"Authorization":marker}});
+        for event in [
+            serde_json::json!({"type":"error","message":marker,"error":detail}),
+            serde_json::json!({"type":"response.failed","response":{
+                "status":"failed","error":detail,"output":[]}}),
+            serde_json::json!({"type":"response.completed","response":{
+                "status":"completed","error":detail,"output":[]}}),
+        ] {
+            let error = parse_response(&sse(&[&event.to_string()]), Instant::now())
+                .expect_err("错误终态必须失败");
+            assert_eq!(error.kind, ModelFailure::Incomplete);
+            assert!(!error.message.contains(marker));
+            assert!(!error.message.contains("Authorization"));
+            assert!(!error.message.contains("token"));
+        }
+    }
+
+    #[test]
+    fn host_faults_use_fixed_categories_instead_of_untrusted_text() {
+        let marker = "upstream-private-fixture";
+        for code in [
+            ErrorCode::Unsupported,
+            ErrorCode::Rejected,
+            ErrorCode::InvalidInput,
+            ErrorCode::PermissionDenied,
+            ErrorCode::Upstream,
+            ErrorCode::Fault,
+            ErrorCode::Timeout,
+            ErrorCode::Cancelled,
+            ErrorCode::Uncertain,
+            ErrorCode::Capacity,
+            ErrorCode::Conflict,
+        ] {
+            let mut fault = PluginFault::new(code, marker);
+            fault.details = Some(serde_json::json!({"token":marker}));
+            let error = ModelError::host(fault);
+            assert_eq!(error.kind, ModelFailure::Host);
+            assert!(!error.message.contains(marker));
+            assert!(!error.message.contains("token"));
+            if code == ErrorCode::Timeout {
+                assert_eq!(error.message, "模型请求超时");
+            }
+        }
     }
 
     #[test]

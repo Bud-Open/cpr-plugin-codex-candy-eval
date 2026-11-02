@@ -19,6 +19,7 @@ use tokio::process::Command;
 #[derive(Clone, Copy)]
 enum KeyCase {
     Enabled,
+    StreamFailure,
     Disabled,
     LookupFailure,
 }
@@ -80,12 +81,30 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
     let mut record = None;
     let mut states = std::collections::BTreeMap::<String, Value>::new();
     let mut returned = false;
-    for _ in 0..100 {
+    let mut scheduling = [0usize; 3];
+    // v7 允许等待期间多轮挂起/恢复，进度由外层期限约束，不限制帧数
+    loop {
         if record.is_some() && returned {
             break;
         }
         let frame = read_frame(&mut output).await.unwrap();
         let (id, method, params) = match frame.message {
+            Message::Suspend { .. } => {
+                scheduling[0] += 1;
+                continue;
+            }
+            Message::CallbackConsumed { .. } => {
+                scheduling[2] += 1;
+                continue;
+            }
+            Message::Resume { id, epoch } => {
+                assert!(epoch > 0);
+                scheduling[1] += 1;
+                write_frame(&mut input, &Frame::control(Message::Resumed { id, epoch }))
+                    .await
+                    .unwrap();
+                continue;
+            }
             Message::Result { id, result } => {
                 assert_eq!(id, 1);
                 assert_eq!(result["status"], 200);
@@ -159,11 +178,11 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
                     KeyCase::Disabled => json!({
                         "keys":[{"id":"test-disabled-key","name":"fixture","enabled":false}],"next_cursor":null
                     }),
-                    KeyCase::Enabled if params["cursor"].is_null() => {
+                    KeyCase::Enabled | KeyCase::StreamFailure if params["cursor"].is_null() => {
                         assert_eq!(params["cursor"], Value::Null);
                         json!({"keys":[{"id":"test-disabled-key","name":"fixture","enabled":false}],"next_cursor":"test-next-page"})
                     }
-                    KeyCase::Enabled => {
+                    KeyCase::Enabled | KeyCase::StreamFailure => {
                         assert_eq!(params["cursor"], "test-next-page");
                         json!({"keys":[{"id":"test-enabled-key","name":"fixture","enabled":true}],"next_cursor":null})
                     }
@@ -195,7 +214,14 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
                     "output":[{"type":"message","content":[{"type":"output_text","text":"最少需要 21 颗糖果。"}]}],
                     "usage":{"input_tokens":42,"output_tokens":12,"output_tokens_details":{"reasoning_tokens":3}}
                 }});
-                let raw = format!("event: response.completed\ndata: {}\n\n", response);
+                let response = if matches!(key_case, KeyCase::StreamFailure) {
+                    json!({"type":"error","error":{
+                        "message":"upstream-private-fixture", "credential":"upstream-private-fixture"
+                    }})
+                } else {
+                    response
+                };
+                let raw = format!("data: {response}\n\n");
                 payload = ModelEventBatch {
                     events: vec![ExecutionEvent::wire(WireEvent {
                         protocol: "openai".to_owned(),
@@ -254,6 +280,10 @@ async fn run_contract(key_case: KeyCase) -> (Value, usize, bool) {
         .unwrap();
     }
     assert!(returned, "management reply must complete");
+    assert!(
+        scheduling.into_iter().all(|count| count > 0),
+        "RPC must suspend, resume through host authorization and consume callback results"
+    );
     (
         record.expect("test outcome must be persisted"),
         executions,
@@ -277,6 +307,17 @@ async fn management_model_request_has_explicit_identity_and_decodes_official_str
     assert!(record["answer"].as_str().unwrap().contains("21"));
     assert_eq!(record["input_tokens"], 42);
     assert_eq!(record["output_tokens"], 12);
+}
+
+#[tokio::test]
+async fn streamed_error_is_sanitized_before_persisting_the_test_record() {
+    let (record, executions, closed) = bounded(KeyCase::StreamFailure).await;
+    assert_eq!(executions, 1);
+    assert!(closed);
+    assert_eq!(record["ok"], false);
+    assert_eq!(record["error"], "模型返回错误事件");
+    assert!(!record.to_string().contains("upstream-private-fixture"));
+    assert_eq!(record["answer"].as_str().unwrap_or_default(), "");
 }
 
 #[tokio::test]

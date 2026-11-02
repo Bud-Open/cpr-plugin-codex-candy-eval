@@ -137,9 +137,7 @@ impl Fixture {
                     "query": if background { "background=1" } else { query },
                     "content_type": if body.is_some() { Some("application/json") } else { None },
                     "headers":headers,
-                })
-                .try_into()
-                .unwrap(),
+                }),
             },
             body.map(|value| serde_json::to_vec(&value).unwrap())
                 .unwrap_or_default(),
@@ -150,6 +148,11 @@ impl Fixture {
     async fn pump(&mut self) {
         let frame = self.read().await;
         let (id, method, params) = match frame.message {
+            Message::Suspend { .. } | Message::CallbackConsumed { .. } => return,
+            Message::Resume { id, epoch } => {
+                self.send(Message::Resumed { id, epoch }, Vec::new()).await;
+                return;
+            }
             Message::Callback {
                 id,
                 parent_id,
@@ -334,7 +337,7 @@ impl Fixture {
                     account_id: None,
                     credential_revision: None,
                 },
-                params: json!({}).try_into().unwrap(),
+                params: json!({}),
             },
             vec![],
         )

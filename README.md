@@ -30,13 +30,15 @@
 
 ### 官方 CPR 上的后台评测
 
-v1.7.x 使用官方 CPR `>= 3.32.0, < 3.33.0` 和插件 RPC v6，并支持新版模型事件中的 WebSocket 原文。CPR `>= 3.31.0, < 3.32.0` 使用 v1.6.x（RPC v5）；CPR `>= 3.30.2, < 3.31.0` 使用 v1.5.x（RPC v5）；CPR `>= 3.29.7, < 3.30.0` 使用 v1.4.x（RPC v5）。v1.2.x / v1.3.x 使用 CPR `>= 3.29.1, < 3.29.7` 和 RPC v4；CPR 3.28.x 请使用 v1.1.3（RPC v2）。插件自动为每个测试账号创建自己的单账号分组和测试 Key，不更改账号原有分组，不复用业务 Key。每次启动前检查组内只有目标账号、Key 只关联该组且保留预算和限流；检查失败就拒绝启动。
+v1.11.x 使用官方 CPR `>= 3.38.1, < 3.39.0` 和插件 RPC v7；CPR `>= 3.37.2, < 3.38.0` 使用 v1.10.x（RPC v7）；CPR `>= 3.35.1, < 3.36.0` 使用 v1.9.x（RPC v7）；CPR `>= 3.34.0, < 3.35.0` 使用 v1.8.x（RPC v7）。官方 SDK 管理任务挂起、恢复授权和回调消费。CPR `>= 3.32.0, < 3.33.0` 使用 v1.7.x（RPC v6）；两者均支持模型事件中的 WebSocket 原文。CPR `>= 3.31.0, < 3.32.0` 使用 v1.6.x（RPC v5）；CPR `>= 3.30.2, < 3.31.0` 使用 v1.5.x（RPC v5）；CPR `>= 3.29.7, < 3.30.0` 使用 v1.4.x（RPC v5）。v1.2.x / v1.3.x 使用 CPR `>= 3.29.1, < 3.29.7` 和 RPC v4；CPR 3.28.x 请使用 v1.1.3（RPC v2）。插件自动为每个测试账号创建自己的单账号分组和测试 Key，不更改账号原有分组，不复用业务 Key。每次启动前检查组内只有目标账号、Key 只关联该组且保留预算和限流；检查失败就拒绝启动。
 
 新建 Key 默认并发上限 16、每分钟 120 请求、每日预算 5 USD、每周预算 20 USD。可在 CPR 的 Key 管理中调整预算或下调限流；并发须为 1–16、每分钟请求上限须为 1–120，日预算和周预算须保持正数。Key 仅在执行器内存中使用，不传给页面或写入插件状态。
 
 默认请求同一网络命名空间内的 `http://127.0.0.1:8080`。如果 CPR 使用其他监听地址，在插件配置中设置 `api_base_url`；仅接受回环 IP，不允许域名、认证、路径或查询参数。执行器禁用环境代理和重定向，避免把测试 Key 发到其他机器。
 
-结果仍保存在 CPR 原生状态库。页面打开时由状态查询写入；没有任何页面时，由官方周期维护回调提交。模型执行不依赖维护回调的 30 秒调用期限。页面关闭不取消任务；停止或重启插件进程会结束在途任务，已有持久化历史保留。
+结果仍保存在 CPR 原生状态库。页面打开时由状态查询写入；没有任何页面时，由官方周期维护回调提交。RPC v7 的维护调用默认预算为 120 秒，与每轮结束后约 30 秒的调度间隔不同；后台模型执行不占用维护调用预算。页面关闭不取消任务；停止或重启插件进程会结束在途任务，已有持久化历史保留。
+
+模型失败记录只使用固定错误类别和白名单状态，不保存上游错误正文、请求头或错误详情。既有历史不会自动改写；目标侧运维摘要同样只输出白名单枚举、计数和字符串长度，不回传账号标识或错误原文。
 
 `patches/` 保留的是 v1.0.14 的历史过渡方案，原生后台执行不使用这些补丁。请按上述协议版本选择插件与官方 CPR 镜像。
 
@@ -60,20 +62,25 @@ v1.7.x 使用官方 CPR `>= 3.32.0, < 3.33.0` 和插件 RPC v6，并支持新版
 
 ## 构建与测试
 
-依赖：Rust 工具链、Node.js（页面契约测试）、与目标宿主协议匹配的官方 `cpr-plugin` CLI。v1.7.x 使用 CPR 3.32.0 的 RPC v6 打包器；v1.6.x 使用 CPR 3.31.0 的 RPC v5 打包器；v1.5.x 使用 CPR 3.30.2 的 RPC v5 打包器；v1.4.x 使用 CPR 3.29.7 的 RPC v5 打包器；v1.2.x / v1.3.x 使用 RPC v4 打包器。可用 `CPR_PLUGIN_CLI` 指定 CLI 路径；旧版 CLI 会拒绝新版清单。
+依赖：Rust **1.99.1**、Python 3、Node.js（页面契约测试）、与目标宿主协议匹配的官方 `cpr-plugin` CLI。仓库的 `rust-toolchain.toml` 固定工具链，打包脚本从工程外调用时也默认选择 1.99.1；显式设置 `RUSTUP_TOOLCHAIN` 可覆盖，但必须满足 SDK 的最低版本要求。v1.11.x 使用 CPR 3.38.1 的 RPC v7 打包器；v1.10.x 使用 CPR 3.37.2 的 RPC v7 打包器；v1.9.x 使用 CPR 3.35.1 的 RPC v7 打包器；v1.8.x 使用 CPR 3.34.0 的 RPC v7 打包器；v1.7.x 使用 CPR 3.32.0 的 RPC v6 打包器；v1.6.x 使用 CPR 3.31.0 的 RPC v5 打包器；v1.5.x 使用 CPR 3.30.2 的 RPC v5 打包器；v1.4.x 使用 CPR 3.29.7 的 RPC v5 打包器；v1.2.x / v1.3.x 使用 RPC v4 打包器。可用 `CPR_PLUGIN_CLI` 指定 CLI 路径；旧版 CLI 会拒绝新版清单。
 
 ```bash
-# 单元与契约测试（含握手、驱动、账号契约、模型执行契约）
-cargo test --offline --locked
-# 使用 Rustup 的当前工具链；不要使用无法解析当前锁文件的系统旧 Cargo。
-# 发布脚本默认优先使用 $HOME/.cargo/bin/cargo。
+# 首次准备：先安装工具链并下载依赖，之后才能离线测试
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+cargo fetch --locked
+npm install
 
-# 页面契约测试：在 jsdom 中校验内联资源、沙箱桥调用与交互断言
-npm install            # 首次需要 jsdom 与 css-tree
+# Rust 单元/IPC 契约与 Python 离线运维脱敏回归，不调用真实上游
+cargo test --offline --locked
+python3 -m unittest discover -s tests -p 'test_*.py'
 node tests/check-page.mjs .
 
-# 构建并打包离线制品（自动跑 fmt/test/页面校验/内联打包/release 构建）
-bash tools/package-release.sh
+# 从目标宿主的固定标签源码构建匹配 CLI，工程放在相邻目录
+git clone --branch v3.38.1 --depth 1 https://github.com/zyycn/codex-proxy-rs.git ../cpr-host
+cargo +1.99.1 build --release --locked --manifest-path ../cpr-host/backend/Cargo.toml -p codex-proxy-plugin-cli
+
+# 打包入口自动执行 fmt、Rust/Python 回归、页面校验、内联打包及 release 构建
+CPR_PLUGIN_CLI="$PWD/../cpr-host/backend/target/release/cpr-plugin" bash tools/package-release.sh
 # 输出：dist/native-<version>/nmbb.codex-candy-eval-<version>-x86_64-unknown-linux-gnu.tar.gz
 ```
 
@@ -93,7 +100,7 @@ python3 tests/check-browser-layout.py --port <cdp-port>
 
 ## 安装与升级
 
-v1.7.x 对应官方 CPR `>= 3.32.0, < 3.33.0`（RPC v6）；v1.6.x 对应官方 CPR `>= 3.31.0, < 3.32.0`（RPC v5）；v1.5.x 对应官方 CPR `>= 3.30.2, < 3.31.0`（RPC v5）；v1.4.x 对应官方 CPR `>= 3.29.7, < 3.30.0`（RPC v5）；v1.2.x / v1.3.x 对应 CPR `>= 3.29.1, < 3.29.7`（RPC v4）；CPR 3.28.x 使用 v1.1.3（RPC v2）。均无需宿主补丁，跨协议升级须同时升级宿主与插件。
+v1.11.x 对应官方 CPR `>= 3.38.1, < 3.39.0`（RPC v7）；v1.10.x 对应官方 CPR `>= 3.37.2, < 3.38.0`（RPC v7）；v1.9.x 对应官方 CPR `>= 3.35.1, < 3.36.0`（RPC v7）；v1.8.x 对应官方 CPR `>= 3.34.0, < 3.35.0`（RPC v7）；v1.7.x 对应官方 CPR `>= 3.32.0, < 3.33.0`（RPC v6）；v1.6.x 对应官方 CPR `>= 3.31.0, < 3.32.0`（RPC v5）；v1.5.x 对应官方 CPR `>= 3.30.2, < 3.31.0`（RPC v5）；v1.4.x 对应官方 CPR `>= 3.29.7, < 3.30.0`（RPC v5）；v1.2.x / v1.3.x 对应 CPR `>= 3.29.1, < 3.29.7`（RPC v4）；CPR 3.28.x 使用 v1.1.3（RPC v2）。均无需宿主补丁，跨协议升级须同时升级宿主与插件。
 
 1. 通过 CPR 管理接口上传制品：`POST /api/admin/plugins/artifacts/upload`；
 2. 用 `switch-version` 把既有实例原子切换到新版本（实例 ID 不变，状态与历史记录保留）；

@@ -81,6 +81,7 @@ const entry = "web/ui.html";
 const entryBody = buildPage(root);
 resources.set(entry, { mime: "text/html", body: Buffer.from(entryBody) });
 const document = new JSDOM(entryBody).window.document;
+check(document.querySelector('meta[name="codex-proxy-ui-theme-prefix"]')?.content === "cp", "必须显式声明现有主题变量前缀，避免宿主默认命名空间变化");
 check(document.querySelector("footer")?.textContent.includes(`版本 v${manifest.version}`), "页脚必须显示实际插件版本，不能保留上游 v1.0.0");
 check(![...resources.keys()].some((resource) => resource.endsWith(".js")), "发布清单不能预取独立脚本资源");
 check(!document.querySelector("script[src]"), "发布入口必须内联全部脚本");
