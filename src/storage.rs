@@ -13,9 +13,10 @@ use crate::{
     state::{STATE_KEY, STATE_NAMESPACE},
 };
 
-pub const MAXIMUM_SNAPSHOT_BYTES: usize = 240 * 1024;
+pub const MAXIMUM_SNAPSHOT_BYTES: usize = 512 * 1024;
 const CHUNK_BYTES: usize = 16 * 1024;
-const MAX_CHUNKS: usize = 16;
+// 每块末尾最多回退 3 字节，确保 UTF-8 字符完整且满载时仍有足够分块。
+const MAX_CHUNKS: usize = MAXIMUM_SNAPSHOT_BYTES.div_ceil(CHUNK_BYTES - 3);
 const INDEX_KEY: &str = "snapshot-v2";
 const FORMAT: &str = "candy-eval-chunks-v2";
 
@@ -344,12 +345,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_capacity_saves_reuse_a_bounded_number_of_keys() {
+    async fn existing_v2_snapshot_remains_readable_after_capacity_increase() {
         let store = Memory::default();
+        let old = json!({"text":"a".repeat(240 * 1024 - 11)});
+        let version = save(&store, &old, None).await.unwrap();
+        assert_eq!(load(&store).await.unwrap().unwrap().value, old);
+        assert!(
+            store.records.lock().unwrap()[INDEX_KEY].value["chunks"]
+                .as_u64()
+                .unwrap()
+                <= 16
+        );
+        let expanded = json!({"text":"b".repeat(300 * 1024)});
+        save(&store, &expanded, Some(version)).await.unwrap();
+        assert_eq!(load(&store).await.unwrap().unwrap().value, expanded);
+    }
+
+    #[tokio::test]
+    async fn maximum_utf8_snapshot_fits_even_when_a_boundary_splits_a_character() {
+        let store = Memory::default();
+        let overhead = serde_json::to_vec(&json!({"text":""})).unwrap().len();
+        let budget = MAXIMUM_SNAPSHOT_BYTES - overhead;
+        let text = format!("{}{}", "🧪".repeat(budget / 4), "x".repeat(budget % 4));
+        let value = json!({"text":text});
+        assert_eq!(
+            serde_json::to_vec(&value).unwrap().len(),
+            MAXIMUM_SNAPSHOT_BYTES
+        );
+        save(&store, &value, None).await.unwrap();
+        assert_eq!(
+            store.records.lock().unwrap()[INDEX_KEY].value["chunks"],
+            MAX_CHUNKS
+        );
+        assert_eq!(load(&store).await.unwrap().unwrap().value, value);
+    }
+
+    #[tokio::test]
+    async fn full_escaped_snapshots_and_legacy_key_fit_declared_host_quotas() {
+        let store = Memory::default();
+        let legacy = json!({"text":"l".repeat(240 * 1024 - 11)});
+        store.put(STATE_KEY, legacy.clone(), None).await.unwrap();
         let mut version = None;
-        for n in 0..6 {
-            let value =
-                json!({"text":char::from(b'a'+n).to_string().repeat(MAXIMUM_SNAPSHOT_BYTES-11)});
+        for n in 0..3 {
+            let text = format!(
+                "{}{}",
+                "\\".repeat((MAXIMUM_SNAPSHOT_BYTES - 11) / 2),
+                char::from(b'a' + n)
+            );
+            let value = json!({"text":text});
             assert_eq!(
                 serde_json::to_vec(&value).unwrap().len(),
                 MAXIMUM_SNAPSHOT_BYTES
@@ -357,14 +400,40 @@ mod tests {
             version = Some(save(&store, &value, version).await.unwrap());
             assert_eq!(load(&store).await.unwrap().unwrap().value, value);
         }
+        assert_eq!(store.get(STATE_KEY).await.unwrap().unwrap().value, legacy);
+        let manifest = crate::manifest().unwrap();
+        let quota = manifest
+            .state
+            .iter()
+            .find(|s| s.namespace == STATE_NAMESPACE)
+            .unwrap();
         let records = store.records.lock().unwrap();
-        assert!(records.len() <= 33);
-        assert!(
-            records
-                .values()
-                .map(|r| serde_json::to_vec(&r.value).unwrap().len())
-                .sum::<usize>()
-                < 2 * 1024 * 1024
-        );
+        assert_eq!(quota.maximum_records as usize, 2 * MAX_CHUNKS + 2);
+        assert!(records.len() <= quota.maximum_records as usize);
+        let sizes: Vec<_> = records
+            .values()
+            .map(|r| serde_json::to_vec(&r.value).unwrap().len())
+            .collect();
+        assert!(sizes
+            .iter()
+            .all(|size| *size <= quota.maximum_value_bytes as usize));
+        assert!(sizes.iter().sum::<usize>() <= quota.maximum_bytes as usize);
+        let chunk_overhead =
+            serde_json::to_vec(&json!({"sha256":"0".repeat(64),"index":MAX_CHUNKS-1,"data":""}))
+                .unwrap()
+                .len();
+        let index_size = serde_json::to_vec(&Index {
+            format: FORMAT.into(),
+            bank: 1,
+            chunks: MAX_CHUNKS,
+            bytes: MAXIMUM_SNAPSHOT_BYTES,
+            sha256: "0".repeat(64),
+        })
+        .unwrap()
+        .len();
+        let worst_case = 2 * MAX_CHUNKS * (2 * CHUNK_BYTES + chunk_overhead)
+            + quota.maximum_value_bytes as usize
+            + index_size;
+        assert!(worst_case <= quota.maximum_bytes as usize);
     }
 }

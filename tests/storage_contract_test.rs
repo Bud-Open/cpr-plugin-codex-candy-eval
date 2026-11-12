@@ -228,6 +228,27 @@ async fn large_recovery_is_idempotent_and_survives_a_new_process() {
 }
 
 #[tokio::test]
+async fn recovery_above_the_old_limit_merges_history_and_survives_reload() {
+    let mut incoming = snapshot(18);
+    for result in incoming["results"]["test-account"].as_array_mut().unwrap() {
+        result["answer"] = json!("绘图abc\\\"\n".repeat(1800));
+    }
+    let size = serde_json::to_vec(&incoming).unwrap().len();
+    assert!(size > 240 * 1024 && size < 512 * 1024);
+    let mut host = Host::start(legacy()).await;
+    let (status, report) = host.call("POST", "api/storage/recover", &incoming).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["counts"]["results"], 20);
+    let records = host.stop().await;
+    let mut reloaded = Host::start(records).await;
+    let (status, state) = reloaded.call("GET", "api/state", &Value::Null).await;
+    assert_eq!(status, 200);
+    assert_eq!(state["auths"][0]["results"].as_array().unwrap().len(), 20);
+    assert_eq!(state["storage_error"], "");
+    reloaded.stop().await;
+}
+
+#[tokio::test]
 async fn failed_chunk_write_keeps_the_previous_snapshot_and_can_retry() {
     let mut host = Host::start(legacy()).await;
     assert_eq!(
